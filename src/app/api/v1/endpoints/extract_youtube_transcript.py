@@ -7,6 +7,7 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
     YouTubeTranscriptApiException,
 )
+from app.services.helpers import get_youtube_title
 
 router = APIRouter()
 
@@ -17,7 +18,10 @@ async def get_transcript(video_id: str):
         ytt_api = YouTubeTranscriptApi()
         fetched_transcript = ytt_api.fetch(video_id, languages=["en"])
 
+        title = await get_youtube_title(video_id)
+
         return {
+            "video_title": title,
             "video_id": video_id,
             "transcript": fetched_transcript.to_raw_data(),
         }
