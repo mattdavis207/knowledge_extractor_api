@@ -1,3 +1,6 @@
+import base64
+import zlib
+
 import httpx
 
 
@@ -16,3 +19,8 @@ async def get_youtube_title(video_id: str) -> str | None:
 
     response.raise_for_status()
     return response.json().get("title")
+
+def encode_mermaid(mermaid: str) -> str:
+     return base64.urlsafe_b64encode(
+        mermaid.encode("utf-8")
+    ).decode("ascii").rstrip("=")

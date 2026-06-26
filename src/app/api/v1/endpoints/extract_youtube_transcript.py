@@ -7,6 +7,7 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
     YouTubeTranscriptApiException,
 )
+
 from app.services.helpers import get_youtube_title
 
 router = APIRouter()
@@ -48,5 +49,3 @@ async def get_transcript(video_id: str):
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(exc),
         ) from exc
-
-    

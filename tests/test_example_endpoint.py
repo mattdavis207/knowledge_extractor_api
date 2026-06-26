@@ -16,8 +16,18 @@ class StubYouTubeTranscriptApi:
         return StubFetchedTranscript()
 
 
+async def stub_get_youtube_title(video_id: str) -> str:
+    assert video_id == "abc123"
+    return "Stub video"
+
+
 def test_extract_youtube_transcript_path(monkeypatch) -> None:
-    monkeypatch.setattr(extract_youtube_transcript, "YouTubeTranscriptApi", StubYouTubeTranscriptApi)
+    monkeypatch.setattr(
+        extract_youtube_transcript,
+        "YouTubeTranscriptApi",
+        StubYouTubeTranscriptApi,
+    )
+    monkeypatch.setattr(extract_youtube_transcript, "get_youtube_title", stub_get_youtube_title)
     app = create_app()
     client = TestClient(app)
 
@@ -25,6 +35,7 @@ def test_extract_youtube_transcript_path(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json() == {
+        "video_title": "Stub video",
         "video_id": "abc123",
         "transcript": [{"text": "Hello world", "start": 0.0, "duration": 1.5}],
     }
