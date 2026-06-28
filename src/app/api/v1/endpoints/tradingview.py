@@ -1,7 +1,8 @@
+import time
 from typing import Annotated, Literal
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel
 
 from app.core.config import settings
@@ -42,6 +43,11 @@ VALID_TABS: dict[CurrencyPairAssetClass, set[str]] = {
     },
 }
 PAGE_SIZE = 150
+CurrencyPairsCacheKey = tuple[CurrencyPairAssetClass, str, str]
+currency_pairs_cache: dict[
+    CurrencyPairsCacheKey,
+    tuple[float, list["TradingViewCurrencyPair"]],
+] = {}
 
 
 class TradingViewCurrencyPair(BaseModel):
@@ -57,6 +63,7 @@ class TradingViewCurrencyPairsResponse(BaseModel):
     asset_class: CurrencyPairAssetClass
     tab: str
     count: int
+    cached: bool
     symbols: list[str]
     currency_pairs: list[TradingViewCurrencyPair]
 
@@ -155,12 +162,61 @@ async def fetch_currency_pairs_from_leaderboard(
     return list(pairs_by_symbol.values())
 
 
+def get_cached_currency_pairs(
+    key: CurrencyPairsCacheKey,
+) -> list[TradingViewCurrencyPair] | None:
+    cached = currency_pairs_cache.get(key)
+    if not cached:
+        return None
+
+    expires_at, pairs = cached
+    if expires_at <= time.monotonic():
+        currency_pairs_cache.pop(key, None)
+        return None
+
+    return pairs
+
+
+def set_cached_currency_pairs(
+    key: CurrencyPairsCacheKey,
+    pairs: list[TradingViewCurrencyPair],
+) -> None:
+    ttl_seconds = settings.tradingview_currency_pairs_cache_ttl_seconds
+    if ttl_seconds <= 0:
+        return
+
+    currency_pairs_cache[key] = (time.monotonic() + ttl_seconds, pairs)
+
+
+def raise_tradingview_http_error(exc: httpx.HTTPStatusError) -> None:
+    if exc.response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+        headers = {}
+        retry_after = exc.response.headers.get("retry-after")
+        if retry_after:
+            headers["Retry-After"] = retry_after
+
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                "TradingView/RapidAPI rate limit reached. Wait for the quota window to reset, "
+                "upgrade the RapidAPI plan, or retry this endpoint after cached data is available."
+            ),
+            headers=headers or None,
+        ) from exc
+
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=f"TradingView API returned HTTP {exc.response.status_code}.",
+    ) from exc
+
+
 @router.get(
     "/currency-pairs",
     response_model=TradingViewCurrencyPairsResponse,
     summary="List TradingView currency pair symbols for form options",
 )
 async def list_currency_pairs(
+    response: Response,
     asset_class: Annotated[
         CurrencyPairAssetClass,
         Query(description="Use forex for spot currency pairs or futures for currency futures."),
@@ -174,6 +230,10 @@ async def list_currency_pairs(
         ),
     ] = None,
     lang: Annotated[str, Query(min_length=2, max_length=12)] = "en",
+    refresh: Annotated[
+        bool,
+        Query(description="Bypass the in-memory cache and fetch fresh data from TradingView."),
+    ] = False,
 ) -> TradingViewCurrencyPairsResponse:
     selected_tab = tab or DEFAULT_TABS[asset_class]
     if selected_tab not in VALID_TABS[asset_class]:
@@ -183,27 +243,34 @@ async def list_currency_pairs(
             detail=f"Invalid tab '{selected_tab}' for {asset_class}. Valid tabs: {valid_tabs}.",
         )
 
-    try:
-        currency_pairs = await fetch_currency_pairs_from_leaderboard(
-            asset_class=asset_class,
-            tab=selected_tab,
-            lang=lang,
-        )
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"TradingView API returned HTTP {exc.response.status_code}.",
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="TradingView API request failed.",
-        ) from exc
+    cache_key: CurrencyPairsCacheKey = (asset_class, selected_tab, lang)
+    cached = False
+    currency_pairs = None if refresh else get_cached_currency_pairs(cache_key)
+
+    if currency_pairs is None:
+        try:
+            currency_pairs = await fetch_currency_pairs_from_leaderboard(
+                asset_class=asset_class,
+                tab=selected_tab,
+                lang=lang,
+            )
+        except httpx.HTTPStatusError as exc:
+            raise_tradingview_http_error(exc)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="TradingView API request failed.",
+            ) from exc
+        set_cached_currency_pairs(cache_key, currency_pairs)
+    else:
+        cached = True
+        response.headers["X-Cache"] = "HIT"
 
     return TradingViewCurrencyPairsResponse(
         asset_class=asset_class,
         tab=selected_tab,
         count=len(currency_pairs),
+        cached=cached,
         symbols=[pair.symbol for pair in currency_pairs],
         currency_pairs=currency_pairs,
     )

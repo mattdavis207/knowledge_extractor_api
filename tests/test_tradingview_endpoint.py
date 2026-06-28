@@ -1,3 +1,4 @@
+import httpx
 from fastapi.testclient import TestClient
 
 from app.api.v1.endpoints import tradingview
@@ -23,6 +24,8 @@ def test_normalize_tradingview_symbol_uses_existing_exchange_symbol() -> None:
 
 
 def test_list_currency_pairs_endpoint_defaults_to_forex(monkeypatch) -> None:
+    tradingview.currency_pairs_cache.clear()
+
     async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang):
         assert asset_class == "forex"
         assert tab == "all"
@@ -52,6 +55,7 @@ def test_list_currency_pairs_endpoint_defaults_to_forex(monkeypatch) -> None:
         "asset_class": "forex",
         "tab": "all",
         "count": 1,
+        "cached": False,
         "symbols": ["FX:EURUSD"],
         "currency_pairs": [
             {
@@ -67,6 +71,8 @@ def test_list_currency_pairs_endpoint_defaults_to_forex(monkeypatch) -> None:
 
 
 def test_list_currency_pairs_endpoint_uses_currency_futures_tab(monkeypatch) -> None:
+    tradingview.currency_pairs_cache.clear()
+
     async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang):
         assert asset_class == "futures"
         assert tab == "currencies"
@@ -103,3 +109,68 @@ def test_list_currency_pairs_rejects_invalid_tab() -> None:
 
     assert response.status_code == 400
     assert "Invalid tab" in response.json()["detail"]
+
+
+def test_list_currency_pairs_uses_cache(monkeypatch) -> None:
+    tradingview.currency_pairs_cache.clear()
+    calls = 0
+
+    async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang):
+        nonlocal calls
+        calls += 1
+        return [
+            tradingview.TradingViewCurrencyPair(
+                symbol="FX:EURUSD",
+                exchange="FX",
+                ticker="EURUSD",
+                label="Euro / U.S. Dollar (FX:EURUSD)",
+            )
+        ]
+
+    monkeypatch.setattr(
+        tradingview,
+        "fetch_currency_pairs_from_leaderboard",
+        stub_fetch_currency_pairs_from_leaderboard,
+    )
+
+    client = TestClient(create_app())
+
+    first_response = client.get("/api/v1/tradingview/currency-pairs")
+    second_response = client.get("/api/v1/tradingview/currency-pairs")
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.json()["cached"] is False
+    assert second_response.json()["cached"] is True
+    assert second_response.headers["x-cache"] == "HIT"
+    assert calls == 1
+
+
+def test_list_currency_pairs_returns_429_for_upstream_rate_limit(monkeypatch) -> None:
+    tradingview.currency_pairs_cache.clear()
+
+    async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang):
+        request = httpx.Request("GET", "https://example.test")
+        response = httpx.Response(
+            status_code=429,
+            request=request,
+            headers={"Retry-After": "60"},
+        )
+        raise httpx.HTTPStatusError(
+            "Too Many Requests",
+            request=request,
+            response=response,
+        )
+
+    monkeypatch.setattr(
+        tradingview,
+        "fetch_currency_pairs_from_leaderboard",
+        stub_fetch_currency_pairs_from_leaderboard,
+    )
+
+    client = TestClient(create_app())
+    response = client.get("/api/v1/tradingview/currency-pairs")
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "60"
+    assert "rate limit" in response.json()["detail"]
