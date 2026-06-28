@@ -43,11 +43,45 @@ VALID_TABS: dict[CurrencyPairAssetClass, set[str]] = {
     },
 }
 PAGE_SIZE = 150
-CurrencyPairsCacheKey = tuple[CurrencyPairAssetClass, str, str]
+CurrencyPairsCacheKey = tuple[CurrencyPairAssetClass, str, str, int, int]
 currency_pairs_cache: dict[
     CurrencyPairsCacheKey,
-    tuple[float, list["TradingViewCurrencyPair"]],
+    tuple[float, list["TradingViewCurrencyPair"], int | None],
 ] = {}
+COMMON_CURRENCY_PAIRS: dict[CurrencyPairAssetClass, list[dict[str, str]]] = {
+    "forex": [
+        {"symbol": "FX:EURUSD", "description": "Euro / U.S. Dollar"},
+        {"symbol": "FX:GBPUSD", "description": "British Pound / U.S. Dollar"},
+        {"symbol": "FX:USDJPY", "description": "U.S. Dollar / Japanese Yen"},
+        {"symbol": "FX:USDCHF", "description": "U.S. Dollar / Swiss Franc"},
+        {"symbol": "FX:AUDUSD", "description": "Australian Dollar / U.S. Dollar"},
+        {"symbol": "FX:USDCAD", "description": "U.S. Dollar / Canadian Dollar"},
+        {"symbol": "FX:NZDUSD", "description": "New Zealand Dollar / U.S. Dollar"},
+        {"symbol": "FX:EURGBP", "description": "Euro / British Pound"},
+        {"symbol": "FX:EURJPY", "description": "Euro / Japanese Yen"},
+        {"symbol": "FX:GBPJPY", "description": "British Pound / Japanese Yen"},
+        {"symbol": "FX:AUDJPY", "description": "Australian Dollar / Japanese Yen"},
+        {"symbol": "FX:CADJPY", "description": "Canadian Dollar / Japanese Yen"},
+        {"symbol": "FX:CHFJPY", "description": "Swiss Franc / Japanese Yen"},
+        {"symbol": "FX:EURAUD", "description": "Euro / Australian Dollar"},
+        {"symbol": "FX:EURCAD", "description": "Euro / Canadian Dollar"},
+        {"symbol": "FX:GBPAUD", "description": "British Pound / Australian Dollar"},
+        {"symbol": "FX:GBPCAD", "description": "British Pound / Canadian Dollar"},
+        {"symbol": "FX:AUDCAD", "description": "Australian Dollar / Canadian Dollar"},
+        {"symbol": "FX:AUDNZD", "description": "Australian Dollar / New Zealand Dollar"},
+        {"symbol": "FX:NZDJPY", "description": "New Zealand Dollar / Japanese Yen"},
+    ],
+    "futures": [
+        {"symbol": "CME:6E1!", "description": "Euro FX Futures"},
+        {"symbol": "CME:6B1!", "description": "British Pound Futures"},
+        {"symbol": "CME:6J1!", "description": "Japanese Yen Futures"},
+        {"symbol": "CME:6A1!", "description": "Australian Dollar Futures"},
+        {"symbol": "CME:6C1!", "description": "Canadian Dollar Futures"},
+        {"symbol": "CME:6S1!", "description": "Swiss Franc Futures"},
+        {"symbol": "CME:6N1!", "description": "New Zealand Dollar Futures"},
+        {"symbol": "CME:6M1!", "description": "Mexican Peso Futures"},
+    ],
+}
 
 
 class TradingViewCurrencyPair(BaseModel):
@@ -64,6 +98,10 @@ class TradingViewCurrencyPairsResponse(BaseModel):
     tab: str
     count: int
     cached: bool
+    source: Literal["tradingview", "fallback"]
+    start: int
+    limit: int
+    total_count: int | None = None
     symbols: list[str]
     currency_pairs: list[TradingViewCurrencyPair]
 
@@ -115,77 +153,89 @@ async def fetch_currency_pairs_from_leaderboard(
     asset_class: CurrencyPairAssetClass,
     tab: str,
     lang: str,
-) -> list[TradingViewCurrencyPair]:
+    start: int,
+    count: int,
+) -> tuple[list[TradingViewCurrencyPair], int | None]:
     endpoint = LEADERBOARD_ENDPOINTS[asset_class]
     headers = get_tradingview_headers()
     base_url = str(settings.tradingview_api_base_url).rstrip("/")
     pairs_by_symbol: dict[str, TradingViewCurrencyPair] = {}
-    start = 0
-    total_count: int | None = None
 
     async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
-        while total_count is None or start < total_count:
-            response = await client.get(
-                f"{base_url}{endpoint}",
-                headers=headers,
-                params={
-                    "tab": tab,
-                    "columnset": "overview",
-                    "start": start,
-                    "count": PAGE_SIZE,
-                    "lang": lang,
-                },
+        response = await client.get(
+            f"{base_url}{endpoint}",
+            headers=headers,
+            params={
+                "tab": tab,
+                "columnset": "overview",
+                "start": start,
+                "count": count,
+                "lang": lang,
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        if not payload.get("success", False):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=payload.get("msg") or "TradingView API request failed.",
             )
-            response.raise_for_status()
-            payload = response.json()
 
-            if not payload.get("success", False):
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=payload.get("msg") or "TradingView API request failed.",
-                )
+        data = payload.get("data") or {}
+        rows = data.get("data") or []
+        total_count = data.get("totalCount", len(rows))
 
-            data = payload.get("data") or {}
-            rows = data.get("data") or []
-            total_count = data.get("totalCount", len(rows))
+        for row in rows:
+            pair = normalize_tradingview_symbol(row)
+            if pair:
+                pairs_by_symbol[pair.symbol] = pair
 
-            for row in rows:
-                pair = normalize_tradingview_symbol(row)
-                if pair:
-                    pairs_by_symbol[pair.symbol] = pair
+    return list(pairs_by_symbol.values()), total_count
 
-            if len(rows) < PAGE_SIZE:
-                break
 
-            start += PAGE_SIZE
-
-    return list(pairs_by_symbol.values())
+def get_fallback_currency_pairs(
+    asset_class: CurrencyPairAssetClass,
+) -> list[TradingViewCurrencyPair]:
+    pairs = []
+    for row in COMMON_CURRENCY_PAIRS[asset_class]:
+        pair = normalize_tradingview_symbol(
+            {
+                "symbol": row["symbol"],
+                "description": row["description"],
+                "type": asset_class,
+            }
+        )
+        if pair:
+            pairs.append(pair)
+    return pairs
 
 
 def get_cached_currency_pairs(
     key: CurrencyPairsCacheKey,
-) -> list[TradingViewCurrencyPair] | None:
+) -> tuple[list[TradingViewCurrencyPair], int | None] | None:
     cached = currency_pairs_cache.get(key)
     if not cached:
         return None
 
-    expires_at, pairs = cached
+    expires_at, pairs, total_count = cached
     if expires_at <= time.monotonic():
         currency_pairs_cache.pop(key, None)
         return None
 
-    return pairs
+    return pairs, total_count
 
 
 def set_cached_currency_pairs(
     key: CurrencyPairsCacheKey,
     pairs: list[TradingViewCurrencyPair],
+    total_count: int | None,
 ) -> None:
     ttl_seconds = settings.tradingview_currency_pairs_cache_ttl_seconds
     if ttl_seconds <= 0:
         return
 
-    currency_pairs_cache[key] = (time.monotonic() + ttl_seconds, pairs)
+    currency_pairs_cache[key] = (time.monotonic() + ttl_seconds, pairs, total_count)
 
 
 def raise_tradingview_http_error(exc: httpx.HTTPStatusError) -> None:
@@ -234,6 +284,8 @@ async def list_currency_pairs(
         bool,
         Query(description="Bypass the in-memory cache and fetch fresh data from TradingView."),
     ] = False,
+    start: Annotated[int, Query(ge=0)] = 0,
+    count: Annotated[int, Query(ge=1, le=PAGE_SIZE)] = PAGE_SIZE,
 ) -> TradingViewCurrencyPairsResponse:
     selected_tab = tab or DEFAULT_TABS[asset_class]
     if selected_tab not in VALID_TABS[asset_class]:
@@ -243,26 +295,39 @@ async def list_currency_pairs(
             detail=f"Invalid tab '{selected_tab}' for {asset_class}. Valid tabs: {valid_tabs}.",
         )
 
-    cache_key: CurrencyPairsCacheKey = (asset_class, selected_tab, lang)
+    cache_key: CurrencyPairsCacheKey = (asset_class, selected_tab, lang, start, count)
     cached = False
-    currency_pairs = None if refresh else get_cached_currency_pairs(cache_key)
+    source: Literal["tradingview", "fallback"] = "tradingview"
+    total_count: int | None = None
+    cached_pairs = None if refresh else get_cached_currency_pairs(cache_key)
 
-    if currency_pairs is None:
+    if cached_pairs is None:
         try:
-            currency_pairs = await fetch_currency_pairs_from_leaderboard(
+            currency_pairs, total_count = await fetch_currency_pairs_from_leaderboard(
                 asset_class=asset_class,
                 tab=selected_tab,
                 lang=lang,
+                start=start,
+                count=count,
             )
         except httpx.HTTPStatusError as exc:
-            raise_tradingview_http_error(exc)
+            if exc.response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+                fallback_pairs = get_fallback_currency_pairs(asset_class)
+                total_count = len(fallback_pairs)
+                currency_pairs = fallback_pairs[start : start + count]
+                source = "fallback"
+                response.status_code = status.HTTP_200_OK
+                response.headers["X-TradingView-Upstream-Status"] = "429"
+            else:
+                raise_tradingview_http_error(exc)
         except httpx.HTTPError as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="TradingView API request failed.",
             ) from exc
-        set_cached_currency_pairs(cache_key, currency_pairs)
+        set_cached_currency_pairs(cache_key, currency_pairs, total_count)
     else:
+        currency_pairs, total_count = cached_pairs
         cached = True
         response.headers["X-Cache"] = "HIT"
 
@@ -271,6 +336,10 @@ async def list_currency_pairs(
         tab=selected_tab,
         count=len(currency_pairs),
         cached=cached,
+        source=source,
+        start=start,
+        limit=count,
+        total_count=total_count,
         symbols=[pair.symbol for pair in currency_pairs],
         currency_pairs=currency_pairs,
     )

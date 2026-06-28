@@ -26,20 +26,25 @@ def test_normalize_tradingview_symbol_uses_existing_exchange_symbol() -> None:
 def test_list_currency_pairs_endpoint_defaults_to_forex(monkeypatch) -> None:
     tradingview.currency_pairs_cache.clear()
 
-    async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang):
+    async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang, start, count):
         assert asset_class == "forex"
         assert tab == "all"
         assert lang == "en"
-        return [
-            tradingview.TradingViewCurrencyPair(
-                symbol="FX:EURUSD",
-                exchange="FX",
-                ticker="EURUSD",
-                label="Euro / U.S. Dollar (FX:EURUSD)",
-                description="Euro / U.S. Dollar",
-                asset_type="forex",
-            )
-        ]
+        assert start == 0
+        assert count == 150
+        return (
+            [
+                tradingview.TradingViewCurrencyPair(
+                    symbol="FX:EURUSD",
+                    exchange="FX",
+                    ticker="EURUSD",
+                    label="Euro / U.S. Dollar (FX:EURUSD)",
+                    description="Euro / U.S. Dollar",
+                    asset_type="forex",
+                )
+            ],
+            1,
+        )
 
     monkeypatch.setattr(
         tradingview,
@@ -56,6 +61,10 @@ def test_list_currency_pairs_endpoint_defaults_to_forex(monkeypatch) -> None:
         "tab": "all",
         "count": 1,
         "cached": False,
+        "source": "tradingview",
+        "start": 0,
+        "limit": 150,
+        "total_count": 1,
         "symbols": ["FX:EURUSD"],
         "currency_pairs": [
             {
@@ -73,20 +82,23 @@ def test_list_currency_pairs_endpoint_defaults_to_forex(monkeypatch) -> None:
 def test_list_currency_pairs_endpoint_uses_currency_futures_tab(monkeypatch) -> None:
     tradingview.currency_pairs_cache.clear()
 
-    async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang):
+    async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang, start, count):
         assert asset_class == "futures"
         assert tab == "currencies"
         assert lang == "en"
-        return [
-            tradingview.TradingViewCurrencyPair(
-                symbol="CME:6E1!",
-                exchange="CME",
-                ticker="6E1!",
-                label="Euro FX Futures (CME:6E1!)",
-                description="Euro FX Futures",
-                asset_type="futures",
-            )
-        ]
+        return (
+            [
+                tradingview.TradingViewCurrencyPair(
+                    symbol="CME:6E1!",
+                    exchange="CME",
+                    ticker="6E1!",
+                    label="Euro FX Futures (CME:6E1!)",
+                    description="Euro FX Futures",
+                    asset_type="futures",
+                )
+            ],
+            1,
+        )
 
     monkeypatch.setattr(
         tradingview,
@@ -115,17 +127,20 @@ def test_list_currency_pairs_uses_cache(monkeypatch) -> None:
     tradingview.currency_pairs_cache.clear()
     calls = 0
 
-    async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang):
+    async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang, start, count):
         nonlocal calls
         calls += 1
-        return [
-            tradingview.TradingViewCurrencyPair(
-                symbol="FX:EURUSD",
-                exchange="FX",
-                ticker="EURUSD",
-                label="Euro / U.S. Dollar (FX:EURUSD)",
-            )
-        ]
+        return (
+            [
+                tradingview.TradingViewCurrencyPair(
+                    symbol="FX:EURUSD",
+                    exchange="FX",
+                    ticker="EURUSD",
+                    label="Euro / U.S. Dollar (FX:EURUSD)",
+                )
+            ],
+            1,
+        )
 
     monkeypatch.setattr(
         tradingview,
@@ -146,10 +161,10 @@ def test_list_currency_pairs_uses_cache(monkeypatch) -> None:
     assert calls == 1
 
 
-def test_list_currency_pairs_returns_429_for_upstream_rate_limit(monkeypatch) -> None:
+def test_list_currency_pairs_returns_fallback_for_upstream_rate_limit(monkeypatch) -> None:
     tradingview.currency_pairs_cache.clear()
 
-    async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang):
+    async def stub_fetch_currency_pairs_from_leaderboard(*, asset_class, tab, lang, start, count):
         request = httpx.Request("GET", "https://example.test")
         response = httpx.Response(
             status_code=429,
@@ -171,6 +186,7 @@ def test_list_currency_pairs_returns_429_for_upstream_rate_limit(monkeypatch) ->
     client = TestClient(create_app())
     response = client.get("/api/v1/tradingview/currency-pairs")
 
-    assert response.status_code == 429
-    assert response.headers["retry-after"] == "60"
-    assert "rate limit" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.headers["x-tradingview-upstream-status"] == "429"
+    assert response.json()["source"] == "fallback"
+    assert "FX:EURUSD" in response.json()["symbols"]
