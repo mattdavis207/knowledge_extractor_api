@@ -272,20 +272,20 @@ def test_price_data_endpoint_accepts_query_params(monkeypatch) -> None:
     client = TestClient(create_app())
     response = client.get(
         "/api/v1/tradingview/price-data",
-        params={
-            "assets": "FX:EURUSD",
-            "timeframe": "W",
-            "sd": "2024-01-01",
-            "ed": "2024-06-01",
-        },
+        params=[
+            ("assets[0]", "FX_IDC:CHFJPY"),
+            ("timeframe", "W"),
+            ("start_date", "2024-01-01"),
+            ("end_date", "2024-06-01"),
+        ],
     )
 
     assert response.status_code == 200
-    assert captured["url"].endswith("/api/price/FX%3AEURUSD")
+    assert captured["url"].endswith("/api/price/FX_IDC%3ACHFJPY")
     assert captured["params"] == {
         "timeframe": "W",
         "range": 22,
         "to": 1717286399,
     }
-    assert response.json()[0]["symbol"] == "FX:EURUSD"
-    assert response.json()[0]["count"] == 1
+    assert response.json()["FX_IDC:CHFJPY"]["symbol"] == "FX_IDC:CHFJPY"
+    assert response.json()["FX_IDC:CHFJPY"]["count"] == 1

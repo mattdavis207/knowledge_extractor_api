@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel
 
 from app.core.config import settings
@@ -498,18 +498,51 @@ async def list_currency_pairs(
     summary="Get TradingView price candles for a symbol and date range",
 )
 async def get_price_data(
-    assets: Annotated[list[str], Query(min_length=1)],
+    request: Request,
     timeframe: str,
-    sd: str,
-    ed: str,
+    assets: Annotated[list[str] | None, Query()] = None,
+    sd: str | None = None,
+    ed: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict:
     endpoint = PRICE_ENDPOINT
     headers = get_tradingview_headers()
     base_url = str(settings.tradingview_api_base_url).rstrip("/")
+    query_params = request.query_params
+    parsed_assets = assets or query_params.getlist("assets[]")
+
+    if not parsed_assets:
+        parsed_assets = [
+            value
+            for key, value in query_params.multi_items()
+            if key.startswith("assets[")
+        ]
+
+    if not parsed_assets:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one assets query parameter is required.",
+        )
+
+    parsed_start_date = sd or start_date
+    parsed_end_date = ed or end_date
+
+    if not parsed_start_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either sd or start_date is required.",
+        )
+
+    if not parsed_end_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either ed or end_date is required.",
+        )
 
     try:
-        candle_range = calculate_candles_range(sd, ed, timeframe)
-        target_timestamp = end_date_to_target_timestamp(ed)
+        candle_range = calculate_candles_range(parsed_start_date, parsed_end_date, timeframe)
+        target_timestamp = end_date_to_target_timestamp(parsed_end_date)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -518,7 +551,7 @@ async def get_price_data(
     
     output = {}
 
-    for asset in assets:
+    for asset in parsed_assets:
 
         async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
             response = await client.get(
@@ -545,8 +578,8 @@ async def get_price_data(
             output[asset] = {
                 "symbol": asset,
                 "timeframe": timeframe,
-                "start_date": sd,
-                "end_date": ed,
+                "start_date": parsed_start_date,
+                "end_date": parsed_end_date,
                 "range": candle_range,
                 "to": target_timestamp,
                 "count": len(history),
