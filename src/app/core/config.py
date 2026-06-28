@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     app_env: str = "local"
     api_v1_prefix: str = "/api/v1"
     http_timeout_seconds: float = Field(default=10.0, gt=0)
+    cors_allow_origins: str = "*"
     github_personal_access_token: str | None = None
     tradingview_api_base_url: AnyHttpUrl = "https://tradingview-data1.p.rapidapi.com"
     tradingview_rapidapi_host: str = "tradingview-data1.p.rapidapi.com"
