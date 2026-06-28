@@ -1,6 +1,10 @@
 import asyncio
+import math
 import time
+from datetime import UTC, date, datetime
+from datetime import time as datetime_time
 from typing import Annotated, Literal
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Response, status
@@ -11,6 +15,16 @@ from app.core.config import settings
 router = APIRouter()
 
 CurrencyPairAssetClass = Literal["forex", "futures"]
+
+PRICE_ENDPOINT: str = "/api/price"
+PRICE_TIMEFRAME_SECONDS: dict[str, int] = {
+    "1": 60,
+    "5": 5 * 60,
+    "15": 15 * 60,
+    "30": 30 * 60,
+    "60": 60 * 60,
+    "240": 240 * 60,
+}
 
 LEADERBOARD_ENDPOINTS: dict[CurrencyPairAssetClass, str] = {
     "forex": "/api/leaderboard/forex",
@@ -107,6 +121,59 @@ class TradingViewCurrencyPairsResponse(BaseModel):
     total_count: int | None = None
     symbols: list[str]
     currency_pairs: list[TradingViewCurrencyPair]
+
+
+def parse_analysis_date(value: str | date | datetime) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def end_date_to_target_timestamp(end_date: str | date | datetime) -> int:
+    parsed_end_date = parse_analysis_date(end_date)
+    end_of_day_utc = datetime.combine(
+        parsed_end_date,
+        datetime_time(23, 59, 59),
+        tzinfo=UTC,
+    )
+    return int(end_of_day_utc.timestamp())
+
+
+def calculate_candles_range(
+    start_date: str | date | datetime,
+    end_date: str | date | datetime,
+    timeframe: str,
+) -> int:
+    parsed_start_date = parse_analysis_date(start_date)
+    parsed_end_date = parse_analysis_date(end_date)
+
+    if parsed_end_date < parsed_start_date:
+        raise ValueError("end_date must be on or after start_date")
+
+    timeframe = str(timeframe)
+    inclusive_days = (parsed_end_date - parsed_start_date).days + 1
+
+    if timeframe == "D":
+        return inclusive_days
+
+    if timeframe == "W":
+        return math.ceil(inclusive_days / 7)
+
+    if timeframe == "M":
+        return (
+            (parsed_end_date.year - parsed_start_date.year) * 12
+            + parsed_end_date.month
+            - parsed_start_date.month
+            + 1
+        )
+
+    if timeframe not in PRICE_TIMEFRAME_SECONDS:
+        raise ValueError(f"Unsupported TradingView price timeframe: {timeframe}")
+
+    seconds_in_range = inclusive_days * 24 * 60 * 60
+    return math.ceil(seconds_in_range / PRICE_TIMEFRAME_SECONDS[timeframe])
 
 
 def get_tradingview_headers() -> dict[str, str]:
@@ -423,3 +490,67 @@ async def list_currency_pairs(
         symbols=[pair.symbol for pair in currency_pairs],
         currency_pairs=currency_pairs,
     )
+
+
+
+@router.get(
+    "/price-data",
+    summary="Get TradingView price candles for a symbol and date range",
+)
+async def get_price_data(
+    assets: Annotated[list[str], Query(min_length=1)],
+    timeframe: str,
+    sd: str,
+    ed: str,
+) -> dict:
+    endpoint = PRICE_ENDPOINT
+    headers = get_tradingview_headers()
+    base_url = str(settings.tradingview_api_base_url).rstrip("/")
+
+    try:
+        candle_range = calculate_candles_range(sd, ed, timeframe)
+        target_timestamp = end_date_to_target_timestamp(ed)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    
+    output = {}
+
+    for asset in assets:
+
+        async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
+            response = await client.get(
+                f"{base_url}{endpoint}/{quote(asset, safe='')}",
+                headers=headers,
+                params={
+                    "timeframe": timeframe,
+                    "range": candle_range,
+                    "to": target_timestamp,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+            if not payload.get("success", False):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=payload.get("msg") or "TradingView API request failed.",
+                )
+
+            data = payload.get("data") or {}
+            history = data.get("history") or []
+            
+            output[asset] = {
+                "symbol": asset,
+                "timeframe": timeframe,
+                "start_date": sd,
+                "end_date": ed,
+                "range": candle_range,
+                "to": target_timestamp,
+                "count": len(history),
+                "history": history,
+            }
+
+    return output

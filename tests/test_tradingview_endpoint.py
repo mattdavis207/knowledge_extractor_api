@@ -231,3 +231,61 @@ def test_list_currency_pairs_returns_fallback_for_upstream_rate_limit(monkeypatc
     assert response.headers["x-tradingview-upstream-status"] == "429"
     assert response.json()["source"] == "fallback"
     assert "FX:EURUSD" in response.json()["symbols"]
+
+
+def test_price_data_endpoint_accepts_query_params(monkeypatch) -> None:
+    captured = {}
+
+    class StubResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {
+                "success": True,
+                "data": {
+                    "history": [
+                        {"time": 1716768000, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05}
+                    ]
+                },
+            }
+
+    class StubAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            pass
+
+        async def get(self, url: str, headers: dict, params: dict) -> StubResponse:
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["params"] = params
+            return StubResponse()
+
+    monkeypatch.setattr(tradingview, "get_tradingview_headers", lambda: {"x-test": "ok"})
+    monkeypatch.setattr(tradingview.httpx, "AsyncClient", StubAsyncClient)
+
+    client = TestClient(create_app())
+    response = client.get(
+        "/api/v1/tradingview/price-data",
+        params={
+            "assets": "FX:EURUSD",
+            "timeframe": "W",
+            "sd": "2024-01-01",
+            "ed": "2024-06-01",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["url"].endswith("/api/price/FX%3AEURUSD")
+    assert captured["params"] == {
+        "timeframe": "W",
+        "range": 22,
+        "to": 1717286399,
+    }
+    assert response.json()[0]["symbol"] == "FX:EURUSD"
+    assert response.json()[0]["count"] == 1
