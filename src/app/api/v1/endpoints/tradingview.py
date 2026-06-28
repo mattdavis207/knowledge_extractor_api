@@ -1,3 +1,4 @@
+import asyncio
 import time
 from typing import Annotated, Literal
 
@@ -43,7 +44,7 @@ VALID_TABS: dict[CurrencyPairAssetClass, set[str]] = {
     },
 }
 PAGE_SIZE = 150
-CurrencyPairsCacheKey = tuple[CurrencyPairAssetClass, str, str, int, int]
+CurrencyPairsCacheKey = tuple[CurrencyPairAssetClass, str, str, int, int, bool]
 currency_pairs_cache: dict[
     CurrencyPairsCacheKey,
     tuple[float, list["TradingViewCurrencyPair"], int | None],
@@ -99,6 +100,8 @@ class TradingViewCurrencyPairsResponse(BaseModel):
     count: int
     cached: bool
     source: Literal["tradingview", "fallback"]
+    all_requested: bool
+    pages_fetched: int
     start: int
     limit: int
     total_count: int | None = None
@@ -194,6 +197,46 @@ async def fetch_currency_pairs_from_leaderboard(
     return list(pairs_by_symbol.values()), total_count
 
 
+async def fetch_all_currency_pairs_from_leaderboard(
+    *,
+    asset_class: CurrencyPairAssetClass,
+    tab: str,
+    lang: str,
+    start: int,
+    count: int,
+    page_delay_seconds: float,
+) -> tuple[list[TradingViewCurrencyPair], int | None, int]:
+    all_pairs_by_symbol: dict[str, TradingViewCurrencyPair] = {}
+    current_start = start
+    total_count: int | None = None
+    pages_fetched = 0
+
+    while total_count is None or current_start < total_count:
+        pairs, total_count = await fetch_currency_pairs_from_leaderboard(
+            asset_class=asset_class,
+            tab=tab,
+            lang=lang,
+            start=current_start,
+            count=count,
+        )
+        pages_fetched += 1
+
+        for pair in pairs:
+            all_pairs_by_symbol[pair.symbol] = pair
+
+        if len(pairs) < count:
+            break
+
+        current_start += count
+        if total_count is not None and current_start >= total_count:
+            break
+
+        if page_delay_seconds > 0:
+            await asyncio.sleep(page_delay_seconds)
+
+    return list(all_pairs_by_symbol.values()), total_count, pages_fetched
+
+
 def get_fallback_currency_pairs(
     asset_class: CurrencyPairAssetClass,
 ) -> list[TradingViewCurrencyPair]:
@@ -286,6 +329,18 @@ async def list_currency_pairs(
     ] = False,
     start: Annotated[int, Query(ge=0)] = 0,
     count: Annotated[int, Query(ge=1, le=PAGE_SIZE)] = PAGE_SIZE,
+    all: Annotated[
+        bool,
+        Query(description="Fetch every page from TradingView, sleeping between upstream calls."),
+    ] = False,
+    page_delay_seconds: Annotated[
+        float | None,
+        Query(
+            ge=0,
+            le=10,
+            description="Delay between upstream page calls when all=true.",
+        ),
+    ] = None,
 ) -> TradingViewCurrencyPairsResponse:
     selected_tab = tab or DEFAULT_TABS[asset_class]
     if selected_tab not in VALID_TABS[asset_class]:
@@ -295,27 +350,49 @@ async def list_currency_pairs(
             detail=f"Invalid tab '{selected_tab}' for {asset_class}. Valid tabs: {valid_tabs}.",
         )
 
-    cache_key: CurrencyPairsCacheKey = (asset_class, selected_tab, lang, start, count)
+    cache_key: CurrencyPairsCacheKey = (asset_class, selected_tab, lang, start, count, all)
     cached = False
     source: Literal["tradingview", "fallback"] = "tradingview"
     total_count: int | None = None
+    pages_fetched = 0
+    delay_seconds = (
+        settings.tradingview_bulk_page_delay_seconds
+        if page_delay_seconds is None
+        else page_delay_seconds
+    )
     cached_pairs = None if refresh else get_cached_currency_pairs(cache_key)
 
     if cached_pairs is None:
         try:
-            currency_pairs, total_count = await fetch_currency_pairs_from_leaderboard(
-                asset_class=asset_class,
-                tab=selected_tab,
-                lang=lang,
-                start=start,
-                count=count,
-            )
+            if all:
+                (
+                    currency_pairs,
+                    total_count,
+                    pages_fetched,
+                ) = await fetch_all_currency_pairs_from_leaderboard(
+                    asset_class=asset_class,
+                    tab=selected_tab,
+                    lang=lang,
+                    start=start,
+                    count=count,
+                    page_delay_seconds=delay_seconds,
+                )
+            else:
+                currency_pairs, total_count = await fetch_currency_pairs_from_leaderboard(
+                    asset_class=asset_class,
+                    tab=selected_tab,
+                    lang=lang,
+                    start=start,
+                    count=count,
+                )
+                pages_fetched = 1
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
                 fallback_pairs = get_fallback_currency_pairs(asset_class)
                 total_count = len(fallback_pairs)
                 currency_pairs = fallback_pairs[start : start + count]
                 source = "fallback"
+                pages_fetched = 0
                 response.status_code = status.HTTP_200_OK
                 response.headers["X-TradingView-Upstream-Status"] = "429"
             else:
@@ -330,6 +407,7 @@ async def list_currency_pairs(
         currency_pairs, total_count = cached_pairs
         cached = True
         response.headers["X-Cache"] = "HIT"
+        pages_fetched = 0
 
     return TradingViewCurrencyPairsResponse(
         asset_class=asset_class,
@@ -337,6 +415,8 @@ async def list_currency_pairs(
         count=len(currency_pairs),
         cached=cached,
         source=source,
+        all_requested=all,
+        pages_fetched=pages_fetched,
         start=start,
         limit=count,
         total_count=total_count,

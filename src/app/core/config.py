@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     tradingview_rapidapi_host: str = "tradingview-data1.p.rapidapi.com"
     tradingview_rapidapi_key: str | None = None
     tradingview_currency_pairs_cache_ttl_seconds: int = Field(default=86400, ge=0)
+    tradingview_bulk_page_delay_seconds: float = Field(default=1.0, ge=0)
     jsonplaceholder_base_url: AnyHttpUrl = "https://jsonplaceholder.typicode.com"
     youtube_webshare_proxy_username: str | None = None
     youtube_webshare_proxy_password: str | None = None
