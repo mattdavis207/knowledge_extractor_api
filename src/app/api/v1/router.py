@@ -1,6 +1,10 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import extract_youtube_transcript, render_mermaid
+from app.api.v1.endpoints import (
+    extract_youtube_transcript,
+    render_mermaid,
+    tradingview,
+)
 
 api_router = APIRouter()
 api_router.include_router(
@@ -9,5 +13,12 @@ api_router.include_router(
     tags=["extract-transcript"],
 )
 api_router.include_router(
-    render_mermaid.router,prefix="/render-mermaid", tags=["render-mermaid"]
+    render_mermaid.router,
+    prefix="/render-mermaid",
+    tags=["render-mermaid"],
+)
+api_router.include_router(
+    tradingview.router,
+    prefix="/tradingview",
+    tags=["tradingview"],
 )
