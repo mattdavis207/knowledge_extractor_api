@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+import app.main
 from app.main import create_app
 
 
@@ -20,7 +21,9 @@ def test_home_page_renders_trading_asset_analysis_form() -> None:
     assert response.status_code == 200
     assert "Trading Asset Analysis" in response.text
     assert "CURRENCY_PAIRS_ENDPOINT" in response.text
+    assert "WEBHOOK_PROXY_ENDPOINT" in response.text
     assert '"/currency-pairs.json"' in response.text
+    assert '"/analysis-webhook"' in response.text
 
 
 def test_cors_preflight_allows_currency_pairs_endpoint() -> None:
@@ -46,3 +49,17 @@ def test_local_currency_pairs_json_route() -> None:
     assert response.status_code == 200
     assert response.json()["count"] == 2512
     assert len(response.json()["currency_pairs"]) == 2512
+
+
+def test_analysis_webhook_proxy_posts_payload(monkeypatch) -> None:
+    async def stub_post_analysis_webhook(payload: dict) -> int:
+        assert payload == {"assets": ["FX:EURUSD"]}
+        return 200
+
+    monkeypatch.setattr(app.main, "post_analysis_webhook", stub_post_analysis_webhook)
+
+    client = TestClient(create_app())
+    response = client.post("/analysis-webhook", json={"assets": ["FX:EURUSD"]})
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "sent", "webhook_status_code": 200}

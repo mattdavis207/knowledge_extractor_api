@@ -360,6 +360,10 @@
       "/currency-pairs.json",
       window.location.origin
     ).toString();
+    const WEBHOOK_PROXY_ENDPOINT = new URL(
+      "/analysis-webhook",
+      window.location.origin
+    ).toString();
     const MAJORS = new Set(["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD"]);
     const MAJOR_CURRENCIES = ["EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"];
     const state = { assets: [], visible: [], selected: new Set() };
@@ -489,7 +493,7 @@
       renderAssets();
     });
 
-    qs("analysisForm").addEventListener("submit", (event) => {
+    qs("analysisForm").addEventListener("submit", async (event) => {
       event.preventDefault();
       qs("assetError").textContent = state.selected.size ? "" : "Select at least one asset.";
       if (!state.selected.size || !validateDates()) return;
@@ -507,7 +511,39 @@
       };
 
       qs("output").style.display = "block";
-      qs("outputJson").textContent = JSON.stringify(submitted, null, 2);
+      qs("outputJson").textContent = JSON.stringify({
+        ...submitted,
+        webhook: { status: "sending" }
+      }, null, 2);
+
+      try {
+        const webhookResponse = await fetch(WEBHOOK_PROXY_ENDPOINT, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(submitted)
+        });
+        const webhookPayload = await webhookResponse.json().catch(() => ({}));
+        if (!webhookResponse.ok) {
+          throw new Error(webhookPayload.detail || `Webhook request failed: ${webhookResponse.status}`);
+        }
+
+        qs("outputJson").textContent = JSON.stringify({
+          ...submitted,
+          webhook: {
+            status: "sent",
+            response: webhookPayload
+          }
+        }, null, 2);
+      } catch (error) {
+        qs("assetError").textContent = `Webhook send failed: ${error.message}`;
+        qs("outputJson").textContent = JSON.stringify({
+          ...submitted,
+          webhook: {
+            status: "failed",
+            error: error.message
+          }
+        }, null, 2);
+      }
     });
 
     qs("analysisForm").addEventListener("reset", () => {
