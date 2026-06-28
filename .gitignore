@@ -16,3 +16,4 @@ htmlcov/
 
 .env
 .DS_Store
+.codex/

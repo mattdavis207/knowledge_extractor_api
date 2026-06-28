@@ -10,6 +10,9 @@ class StubFetchedTranscript:
 
 
 class StubYouTubeTranscriptApi:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
     def fetch(self, video_id: str, languages: list[str]) -> StubFetchedTranscript:
         assert video_id == "abc123"
         assert languages == ["en"]
