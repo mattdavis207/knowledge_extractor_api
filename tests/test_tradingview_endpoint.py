@@ -474,3 +474,53 @@ def test_price_data_endpoint_keeps_unknown_high_before_field(monkeypatch) -> Non
     candle = response.json()["FX_IDC:CHFJPY"]["history"][0]
     assert "high_before" in candle
     assert candle["high_before"] is None
+
+
+def test_high_low_order_handles_newest_first_parent_candles() -> None:
+    parent_candles = [
+        {
+            "time": 1704672000,
+            "open": 1.1,
+            "close": 1.15,
+            "max": 1.2,
+            "min": 1.0,
+            "volume": 220,
+        },
+        {
+            "time": 1704067200,
+            "open": 1.0,
+            "close": 1.05,
+            "max": 1.1,
+            "min": 0.9,
+            "volume": 200,
+        },
+    ]
+    hourly_candles = [
+        {"time": 1704067200, "open": 1.0, "close": 0.95, "max": 1.02, "min": 0.9},
+        {"time": 1704153600, "open": 0.95, "close": 1.05, "max": 1.1, "min": 0.94},
+        {"time": 1704672000, "open": 1.1, "close": 1.18, "max": 1.2, "min": 1.08},
+        {"time": 1704758400, "open": 1.18, "close": 1.05, "max": 1.19, "min": 1.0},
+    ]
+
+    enriched = tradingview.add_high_low_order_to_parent_candles(
+        parent_candles=parent_candles,
+        hourly_candles=hourly_candles,
+        timeframe="W",
+        target_timestamp=1705276799,
+    )
+
+    assert [candle["time"] for candle in enriched] == [1704672000, 1704067200]
+    assert enriched[0]["high_before"] is True
+    assert enriched[1]["high_before"] is False
+
+
+def test_high_low_order_accepts_high_low_field_names() -> None:
+    result = tradingview.find_high_before_low(
+        {"time": 1704067200, "high": 1.1, "low": 0.9},
+        [
+            {"time": 1704067200, "high": 1.1, "low": 1.0},
+            {"time": 1704153600, "high": 1.05, "low": 0.9},
+        ],
+    )
+
+    assert result is True

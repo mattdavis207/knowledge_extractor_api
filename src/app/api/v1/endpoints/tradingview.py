@@ -478,6 +478,23 @@ def prices_match(
     )
 
 
+def get_price_value(candle: dict, keys: tuple[str, ...]) -> float | int | None:
+    for key in keys:
+        value = candle.get(key)
+        if isinstance(value, int | float):
+            return value
+
+    return None
+
+
+def get_high_price(candle: dict) -> float | int | None:
+    return get_price_value(candle, ("max", "high"))
+
+
+def get_low_price(candle: dict) -> float | int | None:
+    return get_price_value(candle, ("min", "low"))
+
+
 def get_candle_time(candle: dict) -> int | None:
     candle_time = candle.get("time")
     if isinstance(candle_time, int):
@@ -515,14 +532,14 @@ def find_high_before_low(
             continue
 
         if high_time is None and prices_match(
-            child_candle.get("max"),
-            parent_candle.get("max"),
+            get_high_price(child_candle),
+            get_high_price(parent_candle),
         ):
             high_time = child_time
 
         if low_time is None and prices_match(
-            child_candle.get("min"),
-            parent_candle.get("min"),
+            get_low_price(child_candle),
+            get_low_price(parent_candle),
         ):
             low_time = child_time
 
@@ -547,20 +564,27 @@ def add_high_low_order_to_parent_candles(
         hourly_candles,
         key=lambda candle: get_candle_time(candle) or 0,
     )
-    enriched_candles = []
+    indexed_parent_candles = list(enumerate(parent_candles))
+    sorted_parent_candles = sorted(
+        indexed_parent_candles,
+        key=lambda item: get_candle_time(item[1]) or 0,
+    )
+    enriched_by_original_index: dict[int, dict] = {}
 
-    for index, parent_candle in enumerate(parent_candles):
+    for sorted_index, (original_index, parent_candle) in enumerate(sorted_parent_candles):
         candle_time = get_candle_time(parent_candle)
         enriched_candle = parent_candle.copy()
 
         if candle_time is None:
             enriched_candle["high_before"] = None
-            enriched_candles.append(enriched_candle)
+            enriched_by_original_index[original_index] = enriched_candle
             continue
 
         next_candle_time = None
-        if index + 1 < len(parent_candles):
-            next_candle_time = get_candle_time(parent_candles[index + 1])
+        if sorted_index + 1 < len(sorted_parent_candles):
+            next_candle_time = get_candle_time(
+                sorted_parent_candles[sorted_index + 1][1]
+            )
 
         if next_candle_time is not None:
             candle_end_time = min(next_candle_time - 1, target_timestamp)
@@ -584,9 +608,13 @@ def add_high_low_order_to_parent_candles(
             enriched_candle,
             candle_hourly_candles,
         )
-        enriched_candles.append(enriched_candle)
+        enriched_by_original_index[original_index] = enriched_candle
 
-    return enriched_candles
+    return [
+        enriched_by_original_index[index]
+        for index in range(len(parent_candles))
+        if index in enriched_by_original_index
+    ]
 
 
 @router.get(
