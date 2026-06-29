@@ -5,14 +5,23 @@ from datetime import UTC, date, datetime
 from datetime import time as datetime_time
 from typing import Annotated, Literal
 from urllib.parse import quote
+import logging
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status, Depends
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
+
+async def debug_request(request: Request) -> None:
+    body = await request.body()
+    logger.info("url=%s", request.url)
+    logger.info("query_params=%s", dict(request.query_params))
+    logger.info("raw_body=%s", body.decode("utf-8", errors="replace"))
 
 CurrencyPairAssetClass = Literal["forex", "futures"]
 AnalysisType = Literal["Bullish Engulfing", "Triple M"]
@@ -999,6 +1008,7 @@ def check_bullish_engulfing(
 async def analyze_price_data(
     history: list[TradingViewPriceCandle],
     analysis_type: AnalysisType,
+    _: None = Depends(debug_request)
 ) -> TradingViewAnalyzeResponse:
     analysis_executions: list[TradingViewAnalysisExecution] = []
 
