@@ -5,23 +5,14 @@ from datetime import UTC, date, datetime
 from datetime import time as datetime_time
 from typing import Annotated, Literal
 from urllib.parse import quote
-import logging
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request, Response, status, Depends
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
 
 router = APIRouter()
-
-logger = logging.getLogger(__name__)
-
-async def debug_request(request: Request) -> None:
-    body = await request.body()
-    logger.info("url=%s", request.url)
-    logger.info("query_params=%s", dict(request.query_params))
-    logger.info("raw_body=%s", body.decode("utf-8", errors="replace"))
 
 CurrencyPairAssetClass = Literal["forex", "futures"]
 AnalysisType = Literal["Bullish Engulfing", "Triple M"]
@@ -964,14 +955,13 @@ def check_bullish_engulfing(
     curr: TradingViewPriceCandle,
     next_candle: TradingViewPriceCandle,
 ) -> bool:
-    
     # Bullish Case
     if curr.close >= curr.open:
         # Second candle closed above prev high
         if curr.close >= prev.max:
 
             # Third candle high ran the second candle high and happened before the low occurred
-            if next_candle.max >= curr.max and next_candle.high_before:
+            if next_candle.max >= curr.max and next_candle.high_before is True:
                 return True
             # Third candle high ran the second candle high; since the low came first,
             # it didn't run the second candle's low at all.
@@ -981,14 +971,14 @@ def check_bullish_engulfing(
                 return False
         else:
             return False
-        
+
     # Bearish Case
     else:
         # Second candle closed below prev low
         if curr.close <= prev.min:
 
             # Third candle low ran the second candle low and happened before the high occurred
-            if next_candle.min <= curr.min and not next_candle.high_before:
+            if next_candle.min <= curr.min and next_candle.high_before is False:
                 return True
             # Third candle low ran the second candle low; since the high came first,
             # it didn't run the second candle's high at all.
@@ -1008,14 +998,14 @@ def check_bullish_engulfing(
 async def analyze_price_data(
     history: list[TradingViewPriceCandle],
     analysis_type: AnalysisType,
-    _: None = Depends(debug_request)
 ) -> TradingViewAnalyzeResponse:
     analysis_executions: list[TradingViewAnalysisExecution] = []
+    sorted_history = sorted(history, key=lambda candle: candle.time)
 
-    for i in range(1, max(len(history) - 1, 1)):
-        prev = history[i - 1]
-        curr = history[i]
-        next_candle = history[i + 1]
+    for i in range(1, max(len(sorted_history) - 1, 1)):
+        prev = sorted_history[i - 1]
+        curr = sorted_history[i]
+        next_candle = sorted_history[i + 1]
 
         if analysis_type == "Bullish Engulfing":
             success = check_bullish_engulfing(prev, curr, next_candle)

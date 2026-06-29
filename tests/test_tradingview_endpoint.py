@@ -610,6 +610,131 @@ def test_analyze_price_data_returns_case_executions_and_totals() -> None:
     assert data["analysis_executions"][1]["success"] is False
 
 
+def test_analyze_price_data_sorts_history_chronologically() -> None:
+    client = TestClient(create_app())
+    history = [
+        {
+            "time": 1704240000,
+            "open": 7.0,
+            "close": 8.0,
+            "max": 13.0,
+            "min": 7.0,
+            "volume": 120,
+            "high_before": True,
+        },
+        {
+            "time": 1704153600,
+            "open": 8.0,
+            "close": 11.0,
+            "max": 12.0,
+            "min": 7.5,
+            "volume": 110,
+        },
+        {
+            "time": 1704067200,
+            "open": 9.0,
+            "close": 8.0,
+            "max": 10.0,
+            "min": 7.0,
+            "volume": 100,
+        },
+    ]
+
+    response = client.post(
+        "/api/v1/tradingview/analyze",
+        params={"analysis_type": "Bullish Engulfing"},
+        json=history,
+    )
+
+    assert response.status_code == 200
+    execution = response.json()["analysis_executions"][0]
+    assert execution["prev"]["time"] == 1704067200
+    assert execution["curr"]["time"] == 1704153600
+    assert execution["next_candle"]["time"] == 1704240000
+    assert execution["success"] is True
+
+
+def test_check_bullish_engulfing_bearish_requires_known_low_first_when_both_sides_run() -> None:
+    prev = tradingview.TradingViewPriceCandle(
+        time=1704067200,
+        open=10.0,
+        close=9.5,
+        max=11.0,
+        min=9.0,
+    )
+    curr = tradingview.TradingViewPriceCandle(
+        time=1704153600,
+        open=9.5,
+        close=8.5,
+        max=10.0,
+        min=8.0,
+    )
+    next_candle = tradingview.TradingViewPriceCandle(
+        time=1704240000,
+        open=8.5,
+        close=9.0,
+        max=10.5,
+        min=7.5,
+        high_before=None,
+    )
+
+    assert tradingview.check_bullish_engulfing(prev, curr, next_candle) is False
+
+
+def test_check_bullish_engulfing_bearish_accepts_known_low_first_when_both_sides_run() -> None:
+    prev = tradingview.TradingViewPriceCandle(
+        time=1704067200,
+        open=10.0,
+        close=9.5,
+        max=11.0,
+        min=9.0,
+    )
+    curr = tradingview.TradingViewPriceCandle(
+        time=1704153600,
+        open=9.5,
+        close=8.5,
+        max=10.0,
+        min=8.0,
+    )
+    next_candle = tradingview.TradingViewPriceCandle(
+        time=1704240000,
+        open=8.5,
+        close=9.0,
+        max=10.5,
+        min=7.5,
+        high_before=False,
+    )
+
+    assert tradingview.check_bullish_engulfing(prev, curr, next_candle) is True
+
+
+def test_check_bullish_engulfing_bearish_accepts_low_run_without_high_run() -> None:
+    prev = tradingview.TradingViewPriceCandle(
+        time=1704067200,
+        open=10.0,
+        close=9.5,
+        max=11.0,
+        min=9.0,
+    )
+    curr = tradingview.TradingViewPriceCandle(
+        time=1704153600,
+        open=9.5,
+        close=8.5,
+        max=10.0,
+        min=8.0,
+    )
+    next_candle = tradingview.TradingViewPriceCandle(
+        time=1704240000,
+        open=8.5,
+        close=9.0,
+        max=9.5,
+        min=7.5,
+        high_before=None,
+    )
+
+    assert tradingview.check_bullish_engulfing(prev, curr, next_candle) is True
+
+
 def test_high_low_order_handles_newest_first_parent_candles() -> None:
     parent_candles = [
         {
