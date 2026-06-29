@@ -149,6 +149,21 @@ class TradingViewPriceData(BaseModel):
     hourly_candles: list[TradingViewPriceCandle] = Field(default_factory=list)
 
 
+class TradingViewAnalysisExecution(BaseModel):
+    analysis_type: AnalysisType
+    success: bool
+    prev: TradingViewPriceCandle
+    curr: TradingViewPriceCandle
+    next_candle: TradingViewPriceCandle
+
+
+class TradingViewAnalyzeResponse(BaseModel):
+    analysis_type: AnalysisType
+    success_count: int
+    failure_count: int
+    analysis_executions: list[TradingViewAnalysisExecution]
+
+
 def parse_analysis_date(value: str | date | datetime) -> date:
     if isinstance(value, datetime):
         return value.date()
@@ -940,22 +955,52 @@ def check_bullish_engulfing(
     curr: TradingViewPriceCandle,
     next_candle: TradingViewPriceCandle,
 ) -> bool:
-    return (
-        curr.close >= curr.open
-        and curr.close > prev.max
-        and next_candle.close > curr.close
-    )
+    
+    # Bullish Case
+    if curr.close >= curr.open:
+        # Second candle closed above prev high
+        if curr.close >= prev.max:
+
+            # Third candle high ran the second candle high and happened before the low occurred
+            if next_candle.max >= curr.max and next_candle.high_before:
+                return True
+            # Third candle high ran the second candle high; since the low came first,
+            # it didn't run the second candle's low at all.
+            elif next_candle.max >= curr.max and next_candle.min >= curr.min:
+                return True
+            else:
+                return False
+        else:
+            return False
+        
+    # Bearish Case
+    else:
+        # Second candle closed below prev low
+        if curr.close <= prev.min:
+
+            # Third candle low ran the second candle low and happened before the high occurred
+            if next_candle.min <= curr.min and not next_candle.high_before:
+                return True
+            # Third candle low ran the second candle low; since the high came first,
+            # it didn't run the second candle's high at all.
+            elif next_candle.min <= curr.min and next_candle.max <= curr.max:
+                return True
+            else:
+                return False
+        else:
+            return False
 
 
 @router.post(
     "/analyze",
     summary="Analyze TradingView historical price candles based on a specific analysis type.",
+    response_model=TradingViewAnalyzeResponse,
 )
 async def analyze_price_data(
     history: list[TradingViewPriceCandle],
     analysis_type: AnalysisType,
-) -> dict[str, int | str]:
-    success_count, failure_count = 0, 0
+) -> TradingViewAnalyzeResponse:
+    analysis_executions: list[TradingViewAnalysisExecution] = []
 
     for i in range(1, max(len(history) - 1, 1)):
         prev = history[i - 1]
@@ -964,14 +1009,22 @@ async def analyze_price_data(
 
         if analysis_type == "Bullish Engulfing":
             success = check_bullish_engulfing(prev, curr, next_candle)
+            analysis_executions.append(
+                TradingViewAnalysisExecution(
+                    analysis_type=analysis_type,
+                    success=success,
+                    prev=prev,
+                    curr=curr,
+                    next_candle=next_candle,
+                )
+            )
 
-            if success:
-                success_count += 1
-            else:
-                failure_count += 1
+    success_count = sum(1 for execution in analysis_executions if execution.success)
+    failure_count = len(analysis_executions) - success_count
 
-    return {
-        "analysis_type": analysis_type,
-        "success_count": success_count,
-        "failure_count": failure_count,
-    }
+    return TradingViewAnalyzeResponse(
+        analysis_type=analysis_type,
+        success_count=success_count,
+        failure_count=failure_count,
+        analysis_executions=analysis_executions,
+    )

@@ -551,6 +551,65 @@ def test_price_data_endpoint_keeps_unknown_high_before_field(monkeypatch) -> Non
     assert candle["high_before"] is None
 
 
+def test_analyze_price_data_returns_case_executions_and_totals() -> None:
+    client = TestClient(create_app())
+    history = [
+        {
+            "time": 1704067200,
+            "open": 9.0,
+            "close": 8.0,
+            "max": 10.0,
+            "min": 7.0,
+            "volume": 100,
+        },
+        {
+            "time": 1704153600,
+            "open": 8.0,
+            "close": 11.0,
+            "max": 12.0,
+            "min": 7.5,
+            "volume": 110,
+        },
+        {
+            "time": 1704240000,
+            "open": 7.0,
+            "close": 8.0,
+            "max": 13.0,
+            "min": 7.0,
+            "volume": 120,
+            "high_before": True,
+        },
+        {
+            "time": 1704326400,
+            "open": 8.0,
+            "close": 8.5,
+            "max": 9.0,
+            "min": 6.5,
+            "volume": 130,
+            "high_before": False,
+        },
+    ]
+
+    response = client.post(
+        "/api/v1/tradingview/analyze",
+        params={"analysis_type": "Bullish Engulfing"},
+        json=history,
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["analysis_type"] == "Bullish Engulfing"
+    assert data["success_count"] == 1
+    assert data["failure_count"] == 1
+    assert len(data["analysis_executions"]) == 2
+    assert data["analysis_executions"][0]["success"] is True
+    assert data["analysis_executions"][0]["analysis_type"] == "Bullish Engulfing"
+    assert data["analysis_executions"][0]["prev"] == {**history[0], "high_before": None}
+    assert data["analysis_executions"][0]["curr"] == {**history[1], "high_before": None}
+    assert data["analysis_executions"][0]["next_candle"] == history[2]
+    assert data["analysis_executions"][1]["success"] is False
+
+
 def test_high_low_order_handles_newest_first_parent_candles() -> None:
     parent_candles = [
         {
