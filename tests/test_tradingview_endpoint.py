@@ -401,6 +401,81 @@ def test_price_data_endpoint_can_include_hourly_candles(monkeypatch) -> None:
     assert data["history"][0]["high_before"] is False
 
 
+def test_price_data_endpoint_fetches_hourly_from_first_parent_candle(monkeypatch) -> None:
+    captured_params = []
+
+    class StubResponse:
+        def __init__(self, history: list[dict]) -> None:
+            self.history = history
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {
+                "success": True,
+                "data": {
+                    "history": self.history,
+                },
+            }
+
+    class StubAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            pass
+
+        async def get(self, url: str, headers: dict, params: dict) -> StubResponse:
+            captured_params.append(params.copy())
+            if params["timeframe"] == "60":
+                return StubResponse(
+                    [
+                        {"time": 1703462400, "open": 1.0, "close": 0.95, "max": 1.01, "min": 0.9},
+                        {"time": 1703548800, "open": 0.95, "close": 1.05, "max": 1.1, "min": 0.94},
+                    ]
+                )
+
+            return StubResponse(
+                [
+                    {
+                        "time": 1703462400,
+                        "open": 1.0,
+                        "close": 1.05,
+                        "max": 1.1,
+                        "min": 0.9,
+                        "volume": 200,
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(tradingview, "get_tradingview_headers", lambda: {"x-test": "ok"})
+    monkeypatch.setattr(tradingview.httpx, "AsyncClient", StubAsyncClient)
+
+    client = TestClient(create_app())
+    response = client.get(
+        "/api/v1/tradingview/price-data",
+        params=[
+            ("assets", "FX_IDC:CHFJPY"),
+            ("timeframe", "W"),
+            ("sd", "2024-01-01"),
+            ("ed", "2024-01-14"),
+            ("include_hourly_candles", "true"),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert captured_params[1] == {
+        "timeframe": "60",
+        "range": 504,
+        "to": 1705276799,
+    }
+    assert response.json()["FX_IDC:CHFJPY"]["history"][0]["high_before"] is False
+
+
 def test_price_data_endpoint_keeps_unknown_high_before_field(monkeypatch) -> None:
     class StubResponse:
         def __init__(self, history: list[dict]) -> None:
@@ -524,3 +599,15 @@ def test_high_low_order_accepts_high_low_field_names() -> None:
     )
 
     assert result is True
+
+
+def test_high_low_order_falls_back_to_hourly_extremes_when_parent_prices_do_not_match() -> None:
+    result = tradingview.find_high_before_low(
+        {"time": 1704067200, "max": 1.11, "min": 0.89},
+        [
+            {"time": 1704067200, "max": 1.02, "min": 0.9},
+            {"time": 1704153600, "max": 1.1, "min": 0.94},
+        ],
+    )
+
+    assert result is False

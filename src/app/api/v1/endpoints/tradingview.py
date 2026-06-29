@@ -478,6 +478,17 @@ def prices_match(
     )
 
 
+def calculate_hourly_range_from_timestamps(
+    start_timestamp: int,
+    end_timestamp: int,
+) -> int:
+    if end_timestamp < start_timestamp:
+        raise ValueError("end_timestamp must be on or after start_timestamp")
+
+    seconds_in_range = end_timestamp - start_timestamp + 1
+    return math.ceil(seconds_in_range / PRICE_TIMEFRAME_SECONDS["60"])
+
+
 def get_price_value(candle: dict, keys: tuple[str, ...]) -> float | int | None:
     for key in keys:
         value = candle.get(key)
@@ -522,11 +533,12 @@ def find_high_before_low(
 ) -> bool | None:
     high_time = None
     low_time = None
-
-    for child_candle in sorted(
+    sorted_child_candles = sorted(
         child_candles,
         key=lambda candle: get_candle_time(candle) or 0,
-    ):
+    )
+
+    for child_candle in sorted_child_candles:
         child_time = get_candle_time(child_candle)
         if child_time is None:
             continue
@@ -545,6 +557,44 @@ def find_high_before_low(
 
         if high_time is not None and low_time is not None:
             break
+
+    if high_time is None or low_time is None:
+        child_highs = [
+            high
+            for child_candle in sorted_child_candles
+            if (high := get_high_price(child_candle)) is not None
+        ]
+        child_lows = [
+            low
+            for child_candle in sorted_child_candles
+            if (low := get_low_price(child_candle)) is not None
+        ]
+
+        if not child_highs or not child_lows:
+            return None
+
+        max_child_high = max(child_highs)
+        min_child_low = min(child_lows)
+
+        for child_candle in sorted_child_candles:
+            child_time = get_candle_time(child_candle)
+            if child_time is None:
+                continue
+
+            if high_time is None and prices_match(
+                get_high_price(child_candle),
+                max_child_high,
+            ):
+                high_time = child_time
+
+            if low_time is None and prices_match(
+                get_low_price(child_candle),
+                min_child_low,
+            ):
+                low_time = child_time
+
+            if high_time is not None and low_time is not None:
+                break
 
     if high_time is None or low_time is None or high_time == low_time:
         return None
@@ -802,7 +852,6 @@ async def get_price_data(
             parsed_end_date,
             timeframe,
         )
-        hourly_range = calculate_candles_range(parsed_start_date, parsed_end_date, "60")
         start_timestamp = start_date_to_target_timestamp(parsed_start_date)
         target_timestamp = end_date_to_target_timestamp(parsed_end_date)
     except ValueError as exc:
@@ -827,10 +876,23 @@ async def get_price_data(
 
             hourly_candles = []
             hourly_to = None
+            hourly_range = None
 
             # get hourly candles if included
             if include_hourly_candles:
                 hourly_to = target_timestamp
+                parent_candle_times = [
+                    candle_time
+                    for candle in history
+                    if (candle_time := get_candle_time(candle)) is not None
+                ]
+                hourly_start_timestamp = (
+                    min(parent_candle_times) if parent_candle_times else start_timestamp
+                )
+                hourly_range = calculate_hourly_range_from_timestamps(
+                    hourly_start_timestamp,
+                    target_timestamp,
+                )
                 hourly_history = await fetch_tradingview_price_history(
                     client=client,
                     base_url=base_url,
@@ -842,7 +904,7 @@ async def get_price_data(
                 )
                 hourly_candles = filter_candles_to_timestamp_range(
                     hourly_history,
-                    start_timestamp,
+                    hourly_start_timestamp,
                     target_timestamp,
                 )
                 history = add_high_low_order_to_parent_candles(
@@ -861,7 +923,7 @@ async def get_price_data(
                 to=target_timestamp,
                 count=len(history),
                 history=history,
-                hourly_range=hourly_range if include_hourly_candles else None,
+                hourly_range=hourly_range,
                 hourly_to=hourly_to,
                 hourly_count=len(hourly_candles),
                 hourly_candles=hourly_candles,
