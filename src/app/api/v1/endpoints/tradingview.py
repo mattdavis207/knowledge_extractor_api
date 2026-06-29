@@ -716,7 +716,6 @@ async def list_currency_pairs(
     "/price-data",
     summary="Get TradingView price candles for a symbol and date range",
     response_model=dict[str, TradingViewPriceData],
-    response_model_exclude_none=True,
 )
 async def get_price_data(
     request: Request,
