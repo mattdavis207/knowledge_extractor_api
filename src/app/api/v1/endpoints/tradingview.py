@@ -975,19 +975,20 @@ def check_bullish_engulfing(
     # Bearish Case
     else:
         # Second candle closed below prev low
-        if curr.close <= prev.min:
+        # if curr.close <= prev.min:
 
-            # Third candle low ran the second candle low and happened before the high occurred
-            if next_candle.min <= curr.min and next_candle.high_before is False:
-                return True
-            # Third candle low ran the second candle low; since the high came first,
-            # it didn't run the second candle's high at all.
-            elif next_candle.min <= curr.min and next_candle.max <= curr.max:
-                return True
-            else:
-                return False
-        else:
-            return False
+        #     # Third candle low ran the second candle low and happened before the high occurred
+        #     if next_candle.min <= curr.min and next_candle.high_before is False:
+        #         return True
+        #     # Third candle low ran the second candle low; since the high came first,
+        #     # it didn't run the second candle's high at all.
+        #     elif next_candle.min <= curr.min and next_candle.max <= curr.max:
+        #         return True
+        #     else:
+        #         return False
+        # else:
+        #     return False
+        return False
 
 
 @router.post(
