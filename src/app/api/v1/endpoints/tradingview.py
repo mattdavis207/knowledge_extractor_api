@@ -8,13 +8,14 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
 
 router = APIRouter()
 
 CurrencyPairAssetClass = Literal["forex", "futures"]
+AnalysisType = Literal["Bullish Engulfing", "Triple M"]
 
 PRICE_ENDPOINT: str = "/api/price"
 PRICE_TIMEFRAME_SECONDS: dict[str, int] = {
@@ -123,6 +124,31 @@ class TradingViewCurrencyPairsResponse(BaseModel):
     currency_pairs: list[TradingViewCurrencyPair]
 
 
+class TradingViewPriceCandle(BaseModel):
+    time: int
+    open: float
+    close: float
+    max: float
+    min: float
+    volume: float | int | None = None
+    high_before: bool | None = None
+
+
+class TradingViewPriceData(BaseModel):
+    symbol: str
+    timeframe: str
+    start_date: str
+    end_date: str
+    range: int
+    to: int
+    count: int
+    history: list[TradingViewPriceCandle]
+    hourly_range: int | None = None
+    hourly_to: int | None = None
+    hourly_count: int = 0
+    hourly_candles: list[TradingViewPriceCandle] = Field(default_factory=list)
+
+
 def parse_analysis_date(value: str | date | datetime) -> date:
     if isinstance(value, datetime):
         return value.date()
@@ -139,6 +165,16 @@ def end_date_to_target_timestamp(end_date: str | date | datetime) -> int:
         tzinfo=UTC,
     )
     return int(end_of_day_utc.timestamp())
+
+
+def start_date_to_target_timestamp(start_date: str | date | datetime) -> int:
+    parsed_start_date = parse_analysis_date(start_date)
+    start_of_day_utc = datetime.combine(
+        parsed_start_date,
+        datetime_time(0, 0, 0),
+        tzinfo=UTC,
+    )
+    return int(start_of_day_utc.timestamp())
 
 
 def calculate_candles_range(
@@ -370,6 +406,189 @@ def raise_tradingview_http_error(exc: httpx.HTTPStatusError) -> None:
     ) from exc
 
 
+async def fetch_tradingview_price_history(
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    headers: dict[str, str],
+    asset: str,
+    timeframe: str,
+    candle_range: int,
+    target_timestamp: int,
+) -> list[dict]:
+    response = await client.get(
+        f"{base_url}{PRICE_ENDPOINT}/{quote(asset, safe='')}",
+        headers=headers,
+        params={
+            "timeframe": timeframe,
+            "range": candle_range,
+            "to": target_timestamp,
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    if not payload.get("success", False):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=payload.get("msg") or "TradingView API request failed.",
+        )
+
+    data = payload.get("data") or {}
+    history = data.get("history") or []
+    if not isinstance(history, list):
+        return []
+
+    return history
+
+
+def filter_candles_to_timestamp_range(
+    history: list[dict],
+    start_timestamp: int,
+    end_timestamp: int,
+) -> list[dict]:
+    filtered_history = []
+
+    for candle in history:
+        if not isinstance(candle, dict):
+            continue
+
+        candle_time = candle.get("time")
+        if not isinstance(candle_time, int):
+            continue
+
+        if start_timestamp <= candle_time <= end_timestamp:
+            filtered_history.append(candle)
+
+    return filtered_history
+
+
+def prices_match(
+    first_price: float | int | None,
+    second_price: float | int | None,
+) -> bool:
+    if first_price is None or second_price is None:
+        return False
+
+    return math.isclose(
+        float(first_price),
+        float(second_price),
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    )
+
+
+def get_candle_time(candle: dict) -> int | None:
+    candle_time = candle.get("time")
+    if isinstance(candle_time, int):
+        return candle_time
+
+    return None
+
+
+def timeframe_to_seconds(timeframe: str) -> int | None:
+    if timeframe in PRICE_TIMEFRAME_SECONDS:
+        return PRICE_TIMEFRAME_SECONDS[timeframe]
+
+    if timeframe == "D":
+        return 24 * 60 * 60
+
+    if timeframe == "W":
+        return 7 * 24 * 60 * 60
+
+    return None
+
+
+def find_high_before_low(
+    parent_candle: dict,
+    child_candles: list[dict],
+) -> bool | None:
+    high_time = None
+    low_time = None
+
+    for child_candle in sorted(
+        child_candles,
+        key=lambda candle: get_candle_time(candle) or 0,
+    ):
+        child_time = get_candle_time(child_candle)
+        if child_time is None:
+            continue
+
+        if high_time is None and prices_match(
+            child_candle.get("max"),
+            parent_candle.get("max"),
+        ):
+            high_time = child_time
+
+        if low_time is None and prices_match(
+            child_candle.get("min"),
+            parent_candle.get("min"),
+        ):
+            low_time = child_time
+
+        if high_time is not None and low_time is not None:
+            break
+
+    if high_time is None or low_time is None or high_time == low_time:
+        return None
+
+    return high_time < low_time
+
+
+def add_high_low_order_to_parent_candles(
+    *,
+    parent_candles: list[dict],
+    hourly_candles: list[dict],
+    timeframe: str,
+    target_timestamp: int,
+) -> list[dict]:
+    timeframe_seconds = timeframe_to_seconds(timeframe)
+    sorted_hourly_candles = sorted(
+        hourly_candles,
+        key=lambda candle: get_candle_time(candle) or 0,
+    )
+    enriched_candles = []
+
+    for index, parent_candle in enumerate(parent_candles):
+        candle_time = get_candle_time(parent_candle)
+        enriched_candle = parent_candle.copy()
+
+        if candle_time is None:
+            enriched_candle["high_before"] = None
+            enriched_candles.append(enriched_candle)
+            continue
+
+        next_candle_time = None
+        if index + 1 < len(parent_candles):
+            next_candle_time = get_candle_time(parent_candles[index + 1])
+
+        if next_candle_time is not None:
+            candle_end_time = min(next_candle_time - 1, target_timestamp)
+        elif timeframe_seconds is not None:
+            candle_end_time = min(candle_time + timeframe_seconds - 1, target_timestamp)
+        else:
+            candle_end_time = target_timestamp
+
+        # get all hourly candles in weekly range
+        candle_hourly_candles = [
+            hourly_candle
+            for hourly_candle in sorted_hourly_candles
+            if (
+                (hourly_candle_time := get_candle_time(hourly_candle)) is not None
+                and candle_time <= hourly_candle_time <= candle_end_time
+            )
+        ]
+
+        # check which came first, high or low
+        enriched_candle["high_before"] = find_high_before_low(
+            enriched_candle,
+            candle_hourly_candles,
+        )
+        enriched_candles.append(enriched_candle)
+
+    return enriched_candles
+
+
 @router.get(
     "/currency-pairs",
     response_model=TradingViewCurrencyPairsResponse,
@@ -496,6 +715,8 @@ async def list_currency_pairs(
 @router.get(
     "/price-data",
     summary="Get TradingView price candles for a symbol and date range",
+    response_model=dict[str, TradingViewPriceData],
+    response_model_exclude_none=True,
 )
 async def get_price_data(
     request: Request,
@@ -505,8 +726,16 @@ async def get_price_data(
     ed: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
-) -> dict:
-    endpoint = PRICE_ENDPOINT
+    include_hourly_candles: Annotated[
+        bool,
+        Query(
+            description=(
+                "Also fetch 1-hour candles for the same date range so analysis can infer "
+                "whether the weekly high or low formed first."
+            )
+        ),
+    ] = False,
+) -> dict[str, TradingViewPriceData]:
     headers = get_tradingview_headers()
     base_url = str(settings.tradingview_api_base_url).rstrip("/")
     query_params = request.query_params
@@ -541,49 +770,119 @@ async def get_price_data(
         )
 
     try:
-        candle_range = calculate_candles_range(parsed_start_date, parsed_end_date, timeframe)
+        candle_range = calculate_candles_range(
+            parsed_start_date,
+            parsed_end_date,
+            timeframe,
+        )
+        hourly_range = calculate_candles_range(parsed_start_date, parsed_end_date, "60")
+        start_timestamp = start_date_to_target_timestamp(parsed_start_date)
         target_timestamp = end_date_to_target_timestamp(parsed_end_date)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
-    
-    output = {}
 
-    for asset in parsed_assets:
+    output: dict[str, TradingViewPriceData] = {}
 
-        async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
-            response = await client.get(
-                f"{base_url}{endpoint}/{quote(asset, safe='')}",
+    async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
+        for asset in parsed_assets:
+            history = await fetch_tradingview_price_history(
+                client=client,
+                base_url=base_url,
                 headers=headers,
-                params={
-                    "timeframe": timeframe,
-                    "range": candle_range,
-                    "to": target_timestamp,
-                },
+                asset=asset,
+                timeframe=timeframe,
+                candle_range=candle_range,
+                target_timestamp=target_timestamp,
             )
-            response.raise_for_status()
-            payload = response.json()
 
-            if not payload.get("success", False):
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=payload.get("msg") or "TradingView API request failed.",
+            hourly_candles = []
+            hourly_to = None
+
+            # get hourly candles if included
+            if include_hourly_candles:
+                hourly_to = target_timestamp
+                hourly_history = await fetch_tradingview_price_history(
+                    client=client,
+                    base_url=base_url,
+                    headers=headers,
+                    asset=asset,
+                    timeframe="60",
+                    candle_range=hourly_range,
+                    target_timestamp=target_timestamp,
+                )
+                hourly_candles = filter_candles_to_timestamp_range(
+                    hourly_history,
+                    start_timestamp,
+                    target_timestamp,
+                )
+                history = add_high_low_order_to_parent_candles(
+                    parent_candles=history,
+                    hourly_candles=hourly_candles,
+                    timeframe=timeframe,
+                    target_timestamp=target_timestamp,
                 )
 
-            data = payload.get("data") or {}
-            history = data.get("history") or []
-            
-            output[asset] = {
-                "symbol": asset,
-                "timeframe": timeframe,
-                "start_date": parsed_start_date,
-                "end_date": parsed_end_date,
-                "range": candle_range,
-                "to": target_timestamp,
-                "count": len(history),
-                "history": history,
-            }
+            output[asset] = TradingViewPriceData(
+                symbol=asset,
+                timeframe=timeframe,
+                start_date=parsed_start_date,
+                end_date=parsed_end_date,
+                range=candle_range,
+                to=target_timestamp,
+                count=len(history),
+                history=history,
+                hourly_range=hourly_range if include_hourly_candles else None,
+                hourly_to=hourly_to,
+                hourly_count=len(hourly_candles),
+                hourly_candles=hourly_candles,
+            )
 
     return output
+
+
+
+
+
+def check_bullish_engulfing(
+    prev: TradingViewPriceCandle,
+    curr: TradingViewPriceCandle,
+    next_candle: TradingViewPriceCandle,
+) -> bool:
+    return (
+        curr.close >= curr.open
+        and curr.close > prev.max
+        and next_candle.close > curr.close
+    )
+
+
+@router.post(
+    "/analyze",
+    summary="Analyze TradingView historical price candles based on a specific analysis type.",
+)
+async def analyze_price_data(
+    history: list[TradingViewPriceCandle],
+    analysis_type: AnalysisType,
+) -> dict[str, int | str]:
+    success_count, failure_count = 0, 0
+
+    for i in range(1, max(len(history) - 1, 1)):
+        prev = history[i - 1]
+        curr = history[i]
+        next_candle = history[i + 1]
+
+        if analysis_type == "Bullish Engulfing":
+            success = check_bullish_engulfing(prev, curr, next_candle)
+
+            if success:
+                success_count += 1
+            else:
+                failure_count += 1
+
+    return {
+        "analysis_type": analysis_type,
+        "success_count": success_count,
+        "failure_count": failure_count,
+    }

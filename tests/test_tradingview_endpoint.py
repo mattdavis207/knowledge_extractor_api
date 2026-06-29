@@ -245,7 +245,14 @@ def test_price_data_endpoint_accepts_query_params(monkeypatch) -> None:
                 "success": True,
                 "data": {
                     "history": [
-                        {"time": 1716768000, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05}
+                        {
+                            "time": 1716768000,
+                            "open": 1.0,
+                            "close": 1.05,
+                            "max": 1.1,
+                            "min": 0.9,
+                            "volume": 1000,
+                        }
                     ]
                 },
             }
@@ -289,3 +296,106 @@ def test_price_data_endpoint_accepts_query_params(monkeypatch) -> None:
     }
     assert response.json()["FX_IDC:CHFJPY"]["symbol"] == "FX_IDC:CHFJPY"
     assert response.json()["FX_IDC:CHFJPY"]["count"] == 1
+
+
+def test_price_data_endpoint_can_include_hourly_candles(monkeypatch) -> None:
+    captured_params = []
+
+    class StubResponse:
+        def __init__(self, history: list[dict]) -> None:
+            self.history = history
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {
+                "success": True,
+                "data": {
+                    "history": self.history,
+                },
+            }
+
+    class StubAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            pass
+
+        async def get(self, url: str, headers: dict, params: dict) -> StubResponse:
+            captured_params.append(params.copy())
+            if params["timeframe"] == "60":
+                return StubResponse(
+                    [
+                        {
+                            "time": 1704067200,
+                            "open": 1.0,
+                            "close": 1.01,
+                            "max": 1.02,
+                            "min": 0.99,
+                            "volume": 100,
+                        },
+                        {
+                            "time": 1704153600,
+                            "open": 1.01,
+                            "close": 1.03,
+                            "max": 1.04,
+                            "min": 1.0,
+                            "volume": 120,
+                        },
+                    ]
+                )
+
+            return StubResponse(
+                [
+                    {
+                        "time": 1704067200,
+                        "open": 1.0,
+                        "close": 1.03,
+                        "max": 1.04,
+                        "min": 0.99,
+                        "volume": 220,
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(tradingview, "get_tradingview_headers", lambda: {"x-test": "ok"})
+    monkeypatch.setattr(tradingview.httpx, "AsyncClient", StubAsyncClient)
+
+    client = TestClient(create_app())
+    response = client.get(
+        "/api/v1/tradingview/price-data",
+        params=[
+            ("assets", "FX_IDC:CHFJPY"),
+            ("timeframe", "W"),
+            ("sd", "2024-01-01"),
+            ("ed", "2024-01-14"),
+            ("include_hourly_candles", "true"),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert captured_params == [
+        {
+            "timeframe": "W",
+            "range": 2,
+            "to": 1705276799,
+        },
+        {
+            "timeframe": "60",
+            "range": 336,
+            "to": 1705276799,
+        },
+    ]
+
+    data = response.json()["FX_IDC:CHFJPY"]
+    assert data["count"] == 1
+    assert data["hourly_range"] == 336
+    assert data["hourly_to"] == 1705276799
+    assert data["hourly_count"] == 2
+    assert data["hourly_candles"][0]["time"] == 1704067200
+    assert data["history"][0]["high_before"] is False
