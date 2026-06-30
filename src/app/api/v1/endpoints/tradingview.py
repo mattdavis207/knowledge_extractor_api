@@ -3,8 +3,9 @@ import math
 import time
 from datetime import UTC, date, datetime
 from datetime import time as datetime_time
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
@@ -16,8 +17,11 @@ router = APIRouter()
 
 CurrencyPairAssetClass = Literal["forex", "futures"]
 AnalysisType = Literal["Bullish Engulfing", "Triple M"]
+PriceCandleType = Literal["Japanese", "HeikinAshi", "Range"]
 
 PRICE_ENDPOINT: str = "/api/price"
+METADATA_EXCHANGES_ENDPOINT: str = "/api/metadata/exchanges"
+NEW_YORK_TIMEZONE = ZoneInfo("America/New_York")
 PRICE_TIMEFRAME_SECONDS: dict[str, int] = {
     "1": 60,
     "5": 5 * 60,
@@ -124,6 +128,11 @@ class TradingViewCurrencyPairsResponse(BaseModel):
     currency_pairs: list[TradingViewCurrencyPair]
 
 
+class TradingViewExchangesResponse(BaseModel):
+    count: int
+    exchanges: list[Any]
+
+
 class TradingViewPriceCandle(BaseModel):
     time: int
     open: float
@@ -137,6 +146,7 @@ class TradingViewPriceCandle(BaseModel):
 class TradingViewPriceData(BaseModel):
     symbol: str
     timeframe: str
+    candle_type: PriceCandleType
     start_date: str
     end_date: str
     range: int
@@ -155,6 +165,15 @@ class TradingViewAnalysisExecution(BaseModel):
     prev: TradingViewPriceCandle
     curr: TradingViewPriceCandle
     next_candle: TradingViewPriceCandle
+    prev_date: date
+    curr_date: date
+    next_date: date
+    prev_utc_datetime: datetime
+    curr_utc_datetime: datetime
+    next_utc_datetime: datetime
+    prev_ny_datetime: datetime
+    curr_ny_datetime: datetime
+    next_ny_datetime: datetime
 
 
 class TradingViewAnalyzeResponse(BaseModel):
@@ -180,6 +199,17 @@ def end_date_to_target_timestamp(end_date: str | date | datetime) -> int:
         tzinfo=UTC,
     )
     return int(end_of_day_utc.timestamp())
+
+def unix_seconds_to_utc_datetime(timestamp: int | float) -> datetime:
+    return datetime.fromtimestamp(timestamp, tz=UTC)
+
+
+def unix_seconds_to_ny_datetime(timestamp: int | float) -> datetime:
+    return unix_seconds_to_utc_datetime(timestamp).astimezone(NEW_YORK_TIMEZONE)
+
+
+def unix_seconds_to_date(timestamp: int | float) -> date:
+    return unix_seconds_to_utc_datetime(timestamp).date()
 
 
 def start_date_to_target_timestamp(start_date: str | date | datetime) -> int:
@@ -238,6 +268,96 @@ def get_tradingview_headers() -> dict[str, str]:
         "x-rapidapi-host": settings.tradingview_rapidapi_host,
         "x-rapidapi-key": settings.tradingview_rapidapi_key,
     }
+
+
+def extract_metadata_list(payload: Any, key: str) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+
+    if not isinstance(payload, dict):
+        return []
+
+    value = payload.get(key)
+    if isinstance(value, list):
+        return value
+
+    data = payload.get("data")
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+
+        nested_data = data.get("data")
+        if isinstance(nested_data, list):
+            return nested_data
+
+        items = data.get("items")
+        if isinstance(items, list):
+            return items
+
+    return []
+
+
+async def fetch_tradingview_metadata_list(endpoint: str, key: str) -> list[Any]:
+    headers = get_tradingview_headers()
+    base_url = str(settings.tradingview_api_base_url).rstrip("/")
+
+    async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
+        response = await client.get(f"{base_url}{endpoint}", headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+
+    if isinstance(payload, dict) and payload.get("success") is False:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=payload.get("msg") or "TradingView API request failed.",
+        )
+
+    return extract_metadata_list(payload, key)
+
+
+async def get_tradingview_exchanges_response() -> TradingViewExchangesResponse:
+    try:
+        exchanges = await fetch_tradingview_metadata_list(METADATA_EXCHANGES_ENDPOINT, "exchanges")
+    except httpx.HTTPStatusError as exc:
+        raise_tradingview_http_error(exc)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="TradingView API request failed.",
+        ) from exc
+
+    return TradingViewExchangesResponse(count=len(exchanges), exchanges=exchanges)
+
+
+@router.get(
+    "/exchanges",
+    summary="Get exchanges supported by the TradingView Data API.",
+    response_model=TradingViewExchangesResponse,
+)
+async def list_exchanges() -> TradingViewExchangesResponse:
+    return await get_tradingview_exchanges_response()
+
+
+@router.get(
+    "/metadata/exchanges",
+    summary="Get exchanges supported by the TradingView Data API.",
+    response_model=TradingViewExchangesResponse,
+)
+async def get_exchanges() -> TradingViewExchangesResponse:
+    return await get_tradingview_exchanges_response()
+
+
+@router.get(
+    "/metadata",
+    summary="Get TradingView exchange metadata.",
+    response_model=TradingViewExchangesResponse,
+)
+async def get_meta_data() -> TradingViewExchangesResponse:
+    return await get_tradingview_exchanges_response()
 
 
 def normalize_tradingview_symbol(row: dict) -> TradingViewCurrencyPair | None:
@@ -428,6 +548,7 @@ async def fetch_tradingview_price_history(
     headers: dict[str, str],
     asset: str,
     timeframe: str,
+    candle_type: PriceCandleType,
     candle_range: int,
     target_timestamp: int,
 ) -> list[dict]:
@@ -436,6 +557,7 @@ async def fetch_tradingview_price_history(
         headers=headers,
         params={
             "timeframe": timeframe,
+            "type": candle_type,
             "range": candle_range,
             "to": target_timestamp,
         },
@@ -813,6 +935,15 @@ async def list_currency_pairs(
 async def get_price_data(
     request: Request,
     timeframe: str,
+    candle_type: Annotated[
+        PriceCandleType,
+        Query(
+            alias="type",
+            description=(
+                "TradingView candle type. Defaults to Japanese/native candles for chart parity."
+            ),
+        ),
+    ] = "Japanese",
     assets: Annotated[list[str] | None, Query()] = None,
     sd: str | None = None,
     ed: str | None = None,
@@ -885,6 +1016,7 @@ async def get_price_data(
                 headers=headers,
                 asset=asset,
                 timeframe=timeframe,
+                candle_type=candle_type,
                 candle_range=candle_range,
                 target_timestamp=target_timestamp,
             )
@@ -914,6 +1046,7 @@ async def get_price_data(
                     headers=headers,
                     asset=asset,
                     timeframe="60",
+                    candle_type=candle_type,
                     candle_range=hourly_range,
                     target_timestamp=target_timestamp,
                 )
@@ -932,6 +1065,7 @@ async def get_price_data(
             output[asset] = TradingViewPriceData(
                 symbol=asset,
                 timeframe=timeframe,
+                candle_type=candle_type,
                 start_date=parsed_start_date,
                 end_date=parsed_end_date,
                 range=candle_range,
@@ -954,26 +1088,35 @@ def check_bullish_engulfing(
     prev: TradingViewPriceCandle,
     curr: TradingViewPriceCandle,
     next_candle: TradingViewPriceCandle,
+    prev_date: date,
 ) -> bool:
     # Bullish Case
+    print(f"{prev_date}: ")
     if curr.close >= curr.open:
         # Second candle closed above prev high
         if curr.close >= prev.max:
 
             # Third candle high ran the second candle high and happened before the low occurred
             if next_candle.max >= curr.max and next_candle.high_before is True:
+                print("third candle high_before + runs second candle high")
                 return True
             # Third candle high ran the second candle high; since the low came first,
             # it didn't run the second candle's low at all.
             elif next_candle.max >= curr.max and next_candle.min >= curr.min:
+                print("third candle high runs second candle high + low was not ran")
                 return True
             else:
+                # Check subsequent candles and validate that high eventually ran
+                # before any low of the current candle is hit.
+                print("something else")
                 return False
         else:
+            print("second candle close above high fail")
             return False
 
     # Bearish Case
     else:
+        print("bearish case")
         # Second candle closed below prev low
         # if curr.close <= prev.min:
 
@@ -1008,8 +1151,19 @@ async def analyze_price_data(
         curr = sorted_history[i]
         next_candle = sorted_history[i + 1]
 
+        prev_date = unix_seconds_to_date(prev.time)
+        curr_date = unix_seconds_to_date(curr.time)
+        next_date = unix_seconds_to_date(next_candle.time)
+        prev_utc_datetime = unix_seconds_to_utc_datetime(prev.time)
+        curr_utc_datetime = unix_seconds_to_utc_datetime(curr.time)
+        next_utc_datetime = unix_seconds_to_utc_datetime(next_candle.time)
+        prev_ny_datetime = unix_seconds_to_ny_datetime(prev.time)
+        curr_ny_datetime = unix_seconds_to_ny_datetime(curr.time)
+        next_ny_datetime = unix_seconds_to_ny_datetime(next_candle.time)
+
         if analysis_type == "Bullish Engulfing":
-            success = check_bullish_engulfing(prev, curr, next_candle)
+            success = check_bullish_engulfing(prev, curr, next_candle, prev_date)
+
             analysis_executions.append(
                 TradingViewAnalysisExecution(
                     analysis_type=analysis_type,
@@ -1017,6 +1171,15 @@ async def analyze_price_data(
                     prev=prev,
                     curr=curr,
                     next_candle=next_candle,
+                    prev_date=prev_date,
+                    curr_date=curr_date,
+                    next_date=next_date,
+                    prev_utc_datetime=prev_utc_datetime,
+                    curr_utc_datetime=curr_utc_datetime,
+                    next_utc_datetime=next_utc_datetime,
+                    prev_ny_datetime=prev_ny_datetime,
+                    curr_ny_datetime=curr_ny_datetime,
+                    next_ny_datetime=next_ny_datetime,
                 )
             )
 

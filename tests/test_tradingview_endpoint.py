@@ -1,3 +1,5 @@
+from datetime import date
+
 import httpx
 from fastapi.testclient import TestClient
 
@@ -21,6 +23,132 @@ def test_normalize_tradingview_symbol_uses_existing_exchange_symbol() -> None:
     assert pair.exchange == "CME"
     assert pair.ticker == "6E1!"
     assert pair.label == "Euro FX Futures (CME:6E1!)"
+
+
+def test_unix_seconds_to_date_uses_utc_date() -> None:
+    assert tradingview.unix_seconds_to_date(1704067200) == date(2024, 1, 1)
+    assert tradingview.unix_seconds_to_date(1704153599) == date(2024, 1, 1)
+
+
+def test_metadata_exchanges_endpoint_returns_upstream_exchanges(monkeypatch) -> None:
+    captured = {}
+
+    class StubResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {
+                "success": True,
+                "data": {
+                    "exchanges": [
+                        {"name": "OANDA", "description": "OANDA"},
+                        {"name": "FXCM", "description": "FXCM"},
+                    ],
+                },
+            }
+
+    class StubAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            pass
+
+        async def get(self, url: str, headers: dict) -> StubResponse:
+            captured["url"] = url
+            captured["headers"] = headers
+            return StubResponse()
+
+    monkeypatch.setattr(tradingview, "get_tradingview_headers", lambda: {"x-test": "ok"})
+    monkeypatch.setattr(tradingview.httpx, "AsyncClient", StubAsyncClient)
+
+    client = TestClient(create_app())
+    response = client.get("/api/v1/tradingview/metadata/exchanges")
+
+    assert response.status_code == 200
+    assert captured["url"].endswith("/api/metadata/exchanges")
+    assert captured["headers"] == {"x-test": "ok"}
+    assert response.json() == {
+        "count": 2,
+        "exchanges": [
+            {"name": "OANDA", "description": "OANDA"},
+            {"name": "FXCM", "description": "FXCM"},
+        ],
+    }
+
+
+def test_metadata_endpoint_alias_returns_exchanges(monkeypatch) -> None:
+    class StubResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {
+                "success": True,
+                "data": [
+                    {"name": "OANDA", "description": "OANDA"},
+                ],
+            }
+
+    class StubAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            pass
+
+        async def get(self, url: str, headers: dict) -> StubResponse:
+            return StubResponse()
+
+    monkeypatch.setattr(tradingview, "get_tradingview_headers", lambda: {"x-test": "ok"})
+    monkeypatch.setattr(tradingview.httpx, "AsyncClient", StubAsyncClient)
+
+    client = TestClient(create_app())
+    response = client.get("/api/v1/tradingview/metadata")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "count": 1,
+        "exchanges": [{"name": "OANDA", "description": "OANDA"}],
+    }
+
+
+def test_exchanges_endpoint_alias_returns_exchanges(monkeypatch) -> None:
+    class StubResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {"success": True, "exchanges": [{"name": "OANDA"}]}
+
+    class StubAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            pass
+
+        async def get(self, url: str, headers: dict) -> StubResponse:
+            return StubResponse()
+
+    monkeypatch.setattr(tradingview, "get_tradingview_headers", lambda: {"x-test": "ok"})
+    monkeypatch.setattr(tradingview.httpx, "AsyncClient", StubAsyncClient)
+
+    client = TestClient(create_app())
+    response = client.get("/api/v1/tradingview/exchanges")
+
+    assert response.status_code == 200
+    assert response.json() == {"count": 1, "exchanges": [{"name": "OANDA"}]}
 
 
 def test_list_currency_pairs_endpoint_defaults_to_forex(monkeypatch) -> None:
@@ -291,10 +419,12 @@ def test_price_data_endpoint_accepts_query_params(monkeypatch) -> None:
     assert captured["url"].endswith("/api/price/FX_IDC%3ACHFJPY")
     assert captured["params"] == {
         "timeframe": "W",
+        "type": "Japanese",
         "range": 22,
         "to": 1717286399,
     }
     assert response.json()["FX_IDC:CHFJPY"]["symbol"] == "FX_IDC:CHFJPY"
+    assert response.json()["FX_IDC:CHFJPY"]["candle_type"] == "Japanese"
     assert response.json()["FX_IDC:CHFJPY"]["count"] == 1
 
 
@@ -382,11 +512,13 @@ def test_price_data_endpoint_can_include_hourly_candles(monkeypatch) -> None:
     assert captured_params == [
         {
             "timeframe": "W",
+            "type": "Japanese",
             "range": 2,
             "to": 1705276799,
         },
         {
             "timeframe": "60",
+            "type": "Japanese",
             "range": 336,
             "to": 1705276799,
         },
@@ -470,6 +602,7 @@ def test_price_data_endpoint_fetches_hourly_from_first_parent_candle(monkeypatch
     assert response.status_code == 200
     assert captured_params[1] == {
         "timeframe": "60",
+        "type": "Japanese",
         "range": 504,
         "to": 1705276799,
     }
@@ -651,6 +784,12 @@ def test_analyze_price_data_sorts_history_chronologically() -> None:
     assert execution["prev"]["time"] == 1704067200
     assert execution["curr"]["time"] == 1704153600
     assert execution["next_candle"]["time"] == 1704240000
+    assert execution["prev_utc_datetime"] == "2024-01-01T00:00:00Z"
+    assert execution["curr_utc_datetime"] == "2024-01-02T00:00:00Z"
+    assert execution["next_utc_datetime"] == "2024-01-03T00:00:00Z"
+    assert execution["prev_ny_datetime"] == "2023-12-31T19:00:00-05:00"
+    assert execution["curr_ny_datetime"] == "2024-01-01T19:00:00-05:00"
+    assert execution["next_ny_datetime"] == "2024-01-02T19:00:00-05:00"
     assert execution["success"] is True
 
 
