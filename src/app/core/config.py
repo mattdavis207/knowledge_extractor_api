@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     tradingview_bulk_page_delay_seconds: float = Field(default=1.0, ge=0)
     tradingview_price_request_delay_seconds: float = Field(default=1.0, ge=0)
     analysis_webhook_url: AnyHttpUrl = (
-        "https://mattdavis207.app.n8n.cloud/webhook-test/"
+        "https://mattdavis207.app.n8n.cloud/webhook/"
         "2b0a8594-f02c-4528-a30b-1971fa379fd9"
     )
     jsonplaceholder_base_url: AnyHttpUrl = "https://jsonplaceholder.typicode.com"
