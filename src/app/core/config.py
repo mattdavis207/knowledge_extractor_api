@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     tradingview_rapidapi_key: str | None = None
     tradingview_currency_pairs_cache_ttl_seconds: int = Field(default=86400, ge=0)
     tradingview_bulk_page_delay_seconds: float = Field(default=1.0, ge=0)
+    tradingview_price_request_delay_seconds: float = Field(default=1.0, ge=0)
     analysis_webhook_url: AnyHttpUrl = (
         "https://mattdavis207.app.n8n.cloud/webhook-test/"
         "2b0a8594-f02c-4528-a30b-1971fa379fd9"

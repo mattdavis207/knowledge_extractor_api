@@ -21,8 +21,10 @@ def test_home_page_renders_trading_asset_analysis_form() -> None:
     assert response.status_code == 200
     assert "Trading Asset Analysis" in response.text
     assert "CURRENCY_PAIRS_ENDPOINT" in response.text
+    assert "EXCHANGES_ENDPOINT" in response.text
     assert "WEBHOOK_PROXY_ENDPOINT" in response.text
     assert '"/currency-pairs.json"' in response.text
+    assert '"/exchanges.json"' in response.text
     assert '"/analysis-webhook"' in response.text
 
 
@@ -49,6 +51,16 @@ def test_local_currency_pairs_json_route() -> None:
     assert response.status_code == 200
     assert response.json()["count"] == 2512
     assert len(response.json()["currency_pairs"]) == 2512
+
+
+def test_local_exchanges_json_route() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/exchanges.json")
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 352
+    assert any(exchange["value"] == "OANDA" for exchange in response.json()["exchanges"])
 
 
 def test_analysis_webhook_proxy_posts_payload(monkeypatch) -> None:

@@ -13,6 +13,7 @@ from app.core.config import settings
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parents[1]
 CURRENCY_PAIRS_PATH = PROJECT_ROOT / "currency_pairs.json"
+EXCHANGES_PATH = PROJECT_ROOT / "exchanges.json"
 
 
 def get_cors_allow_origins() -> list[str]:
@@ -60,6 +61,11 @@ def create_app() -> FastAPI:
     @app.get("/currency-pairs.json", tags=["local-data"])
     async def currency_pairs() -> dict:
         with CURRENCY_PAIRS_PATH.open(encoding="utf-8") as file:
+            return json.load(file)
+
+    @app.get("/exchanges.json", tags=["local-data"])
+    async def exchanges() -> dict:
+        with EXCHANGES_PATH.open(encoding="utf-8") as file:
             return json.load(file)
 
     @app.post("/analysis-webhook", tags=["analysis"])

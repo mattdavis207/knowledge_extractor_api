@@ -5,11 +5,10 @@ from datetime import UTC, date, datetime
 from datetime import time as datetime_time
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import settings
 
@@ -18,10 +17,11 @@ router = APIRouter()
 CurrencyPairAssetClass = Literal["forex", "futures"]
 AnalysisType = Literal["Bullish Engulfing", "Triple M"]
 PriceCandleType = Literal["Japanese", "HeikinAshi", "Range"]
+BiasType = Literal["Bullish", "Bearish", "Both"]
+AnalysisDirection = Literal["Bullish", "Bearish"]
 
 PRICE_ENDPOINT: str = "/api/price"
 METADATA_EXCHANGES_ENDPOINT: str = "/api/metadata/exchanges"
-NEW_YORK_TIMEZONE = ZoneInfo("America/New_York")
 PRICE_TIMEFRAME_SECONDS: dict[str, int] = {
     "1": 60,
     "5": 5 * 60,
@@ -143,8 +143,43 @@ class TradingViewPriceCandle(BaseModel):
     high_before: bool | None = None
 
 
+class TradingViewAssetRequest(BaseModel):
+    exchange: str
+    bias: BiasType = "Both"
+
+
+class TradingViewTimeframeRequest(BaseModel):
+    label: str | None = None
+    query_param: str
+
+
+class TradingViewPriceDataRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    assets: dict[str, TradingViewAssetRequest]
+    timeframe: str | TradingViewTimeframeRequest
+    start_date: str | None = None
+    end_date: str | None = None
+    sd: str | None = None
+    ed: str | None = None
+    candle_type: PriceCandleType = Field(default="Japanese", alias="type")
+    include_hourly_candles: bool = False
+    request_delay_seconds: float | None = Field(default=None, ge=0)
+
+
+class ParsedTradingViewAsset(BaseModel):
+    pair: str
+    exchange: str
+    bias: BiasType
+    symbol: str
+    response_key: str
+
+
 class TradingViewPriceData(BaseModel):
     symbol: str
+    pair: str | None = None
+    exchange: str | None = None
+    bias: BiasType = "Both"
     timeframe: str
     candle_type: PriceCandleType
     start_date: str
@@ -159,8 +194,24 @@ class TradingViewPriceData(BaseModel):
     hourly_candles: list[TradingViewPriceCandle] = Field(default_factory=list)
 
 
+PriceDataInput = (
+    dict[str, TradingViewPriceData]
+    | list[TradingViewPriceData]
+    | list[dict[str, TradingViewPriceData]]
+)
+
+
+class TradingViewPriceDataResponse(BaseModel):
+    price_data: list[dict[str, TradingViewPriceData]]
+
+
 class TradingViewAnalysisExecution(BaseModel):
+    pair: str
+    exchange: str | None = None
+    symbol: str | None = None
+    bias: BiasType
     analysis_type: AnalysisType
+    direction: AnalysisDirection
     success: bool
     prev: TradingViewPriceCandle
     curr: TradingViewPriceCandle
@@ -168,19 +219,46 @@ class TradingViewAnalysisExecution(BaseModel):
     prev_date: date
     curr_date: date
     next_date: date
-    prev_utc_datetime: datetime
-    curr_utc_datetime: datetime
-    next_utc_datetime: datetime
-    prev_ny_datetime: datetime
-    curr_ny_datetime: datetime
-    next_ny_datetime: datetime
+
+
+class TradingViewAnalyzeRequest(BaseModel):
+    analysis_type: AnalysisType
+    histories: dict[str, list[TradingViewPriceCandle]] = Field(default_factory=dict)
+    history: dict[str, list[TradingViewPriceCandle]] | None = None
+    price_data: PriceDataInput = Field(default_factory=dict)
+    assets: dict[str, TradingViewAssetRequest] = Field(default_factory=dict)
+
+
+class TradingViewAssetAnalyzeResult(BaseModel):
+    pair: str
+    exchange: str | None = None
+    symbol: str | None = None
+    bias: BiasType
+    analysis_type: AnalysisType
+    bullish_success_count: int = 0
+    bullish_failure_count: int = 0
+    bullish_total_count: int = 0
+    bearish_success_count: int = 0
+    bearish_failure_count: int = 0
+    bearish_total_count: int = 0
+    total_success_count: int = 0
+    total_failure_count: int = 0
+    total_count: int = 0
+    analysis_executions: list[TradingViewAnalysisExecution]
 
 
 class TradingViewAnalyzeResponse(BaseModel):
     analysis_type: AnalysisType
-    success_count: int
-    failure_count: int
-    analysis_executions: list[TradingViewAnalysisExecution]
+    bullish_success_count: int = 0
+    bullish_failure_count: int = 0
+    bullish_total_count: int = 0
+    bearish_success_count: int = 0
+    bearish_failure_count: int = 0
+    bearish_total_count: int = 0
+    total_success_count: int = 0
+    total_failure_count: int = 0
+    total_count: int = 0
+    assets: dict[str, TradingViewAssetAnalyzeResult]
 
 
 def parse_analysis_date(value: str | date | datetime) -> date:
@@ -204,12 +282,145 @@ def unix_seconds_to_utc_datetime(timestamp: int | float) -> datetime:
     return datetime.fromtimestamp(timestamp, tz=UTC)
 
 
-def unix_seconds_to_ny_datetime(timestamp: int | float) -> datetime:
-    return unix_seconds_to_utc_datetime(timestamp).astimezone(NEW_YORK_TIMEZONE)
-
-
 def unix_seconds_to_date(timestamp: int | float) -> date:
     return unix_seconds_to_utc_datetime(timestamp).date()
+
+
+def parse_symbol_parts(symbol: str) -> tuple[str | None, str]:
+    if ":" not in symbol:
+        return None, symbol.strip().upper()
+
+    exchange, pair = symbol.split(":", maxsplit=1)
+    return exchange.strip().upper(), pair.strip().upper()
+
+
+def build_tradingview_symbol(exchange: str, pair: str) -> str:
+    return f"{exchange.strip().upper()}:{pair.strip().upper()}"
+
+
+def parse_query_price_assets(raw_assets: list[str]) -> list[ParsedTradingViewAsset]:
+    parsed_assets: list[ParsedTradingViewAsset] = []
+
+    for raw_asset in raw_assets:
+        exchange, pair = parse_symbol_parts(raw_asset)
+        symbol = build_tradingview_symbol(exchange, pair) if exchange else pair
+        parsed_assets.append(
+            ParsedTradingViewAsset(
+                pair=pair,
+                exchange=exchange or "",
+                bias="Both",
+                symbol=symbol,
+                response_key=symbol,
+            )
+        )
+
+    return parsed_assets
+
+
+def parse_body_price_assets(
+    assets: dict[str, TradingViewAssetRequest],
+) -> list[ParsedTradingViewAsset]:
+    parsed_assets: list[ParsedTradingViewAsset] = []
+
+    for pair_key, config in assets.items():
+        _, pair = parse_symbol_parts(pair_key)
+        symbol = build_tradingview_symbol(config.exchange, pair)
+        parsed_assets.append(
+            ParsedTradingViewAsset(
+                pair=pair,
+                exchange=config.exchange.strip().upper(),
+                bias=config.bias,
+                symbol=symbol,
+                response_key=pair,
+            )
+        )
+
+    return parsed_assets
+
+
+def normalize_price_data_timeframe(timeframe: str | TradingViewTimeframeRequest) -> str:
+    if isinstance(timeframe, TradingViewTimeframeRequest):
+        return timeframe.query_param
+
+    return timeframe
+
+
+def get_price_data_asset_key(asset_price_data: TradingViewPriceData) -> str:
+    if asset_price_data.pair:
+        return asset_price_data.pair
+
+    _, pair = parse_symbol_parts(asset_price_data.symbol)
+    return pair
+
+
+def add_price_data_to_asset_map(
+    asset_map: dict[str, TradingViewPriceData],
+    asset_key: str,
+    asset_price_data: TradingViewPriceData,
+) -> None:
+    asset_map[asset_key] = asset_price_data
+    asset_map.setdefault(get_price_data_asset_key(asset_price_data), asset_price_data)
+    asset_map.setdefault(asset_price_data.symbol, asset_price_data)
+
+
+def price_data_to_keyed_items(
+    price_data: dict[str, TradingViewPriceData],
+) -> list[dict[str, TradingViewPriceData]]:
+    return [{asset_key: asset_price_data} for asset_key, asset_price_data in price_data.items()]
+
+
+def price_data_to_asset_map(
+    price_data: PriceDataInput,
+) -> dict[str, TradingViewPriceData]:
+    if isinstance(price_data, dict):
+        return price_data
+
+    asset_map: dict[str, TradingViewPriceData] = {}
+
+    for item in price_data:
+        if isinstance(item, TradingViewPriceData):
+            add_price_data_to_asset_map(
+                asset_map,
+                get_price_data_asset_key(item),
+                item,
+            )
+            continue
+
+        for asset_key, asset_price_data in item.items():
+            add_price_data_to_asset_map(asset_map, asset_key, asset_price_data)
+
+    return asset_map
+
+
+def price_data_to_histories(
+    price_data: PriceDataInput,
+) -> dict[str, list[TradingViewPriceCandle]]:
+    if isinstance(price_data, dict):
+        return {
+            asset_key: asset_price_data.history
+            for asset_key, asset_price_data in price_data.items()
+        }
+
+    histories: dict[str, list[TradingViewPriceCandle]] = {}
+
+    for item in price_data:
+        if isinstance(item, TradingViewPriceData):
+            histories[get_price_data_asset_key(item)] = item.history
+            continue
+
+        for asset_key, asset_price_data in item.items():
+            histories[asset_key] = asset_price_data.history
+
+    return histories
+
+
+def get_price_data_for_analysis_asset(
+    pair_key: str,
+    pair: str,
+    price_data: PriceDataInput,
+) -> TradingViewPriceData | None:
+    asset_map = price_data_to_asset_map(price_data)
+    return asset_map.get(pair_key) or asset_map.get(pair)
 
 
 def start_date_to_target_timestamp(start_date: str | date | datetime) -> int:
@@ -926,6 +1137,125 @@ async def list_currency_pairs(
     )
 
 
+async def get_price_data_for_assets(
+    *,
+    parsed_assets: list[ParsedTradingViewAsset],
+    timeframe: str,
+    candle_type: PriceCandleType,
+    parsed_start_date: str,
+    parsed_end_date: str,
+    include_hourly_candles: bool,
+    request_delay_seconds: float | None,
+) -> dict[str, TradingViewPriceData]:
+    headers = get_tradingview_headers()
+    base_url = str(settings.tradingview_api_base_url).rstrip("/")
+    delay_seconds = (
+        settings.tradingview_price_request_delay_seconds
+        if request_delay_seconds is None
+        else request_delay_seconds
+    )
+
+    try:
+        candle_range = calculate_candles_range(
+            parsed_start_date,
+            parsed_end_date,
+            timeframe,
+        )
+        start_timestamp = start_date_to_target_timestamp(parsed_start_date)
+        target_timestamp = end_date_to_target_timestamp(parsed_end_date)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    output: dict[str, TradingViewPriceData] = {}
+    upstream_request_count = 0
+
+    async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
+        for asset in parsed_assets:
+            if upstream_request_count > 0 and delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+            history = await fetch_tradingview_price_history(
+                client=client,
+                base_url=base_url,
+                headers=headers,
+                asset=asset.symbol,
+                timeframe=timeframe,
+                candle_type=candle_type,
+                candle_range=candle_range,
+                target_timestamp=target_timestamp,
+            )
+            upstream_request_count += 1
+
+            hourly_candles = []
+            hourly_to = None
+            hourly_range = None
+
+            # get hourly candles if included
+            if include_hourly_candles:
+                hourly_to = target_timestamp
+                parent_candle_times = [
+                    candle_time
+                    for candle in history
+                    if (candle_time := get_candle_time(candle)) is not None
+                ]
+                hourly_start_timestamp = (
+                    min(parent_candle_times) if parent_candle_times else start_timestamp
+                )
+                hourly_range = calculate_hourly_range_from_timestamps(
+                    hourly_start_timestamp,
+                    target_timestamp,
+                )
+                if upstream_request_count > 0 and delay_seconds > 0:
+                    await asyncio.sleep(delay_seconds)
+
+                hourly_history = await fetch_tradingview_price_history(
+                    client=client,
+                    base_url=base_url,
+                    headers=headers,
+                    asset=asset.symbol,
+                    timeframe="60",
+                    candle_type=candle_type,
+                    candle_range=hourly_range,
+                    target_timestamp=target_timestamp,
+                )
+                upstream_request_count += 1
+                hourly_candles = filter_candles_to_timestamp_range(
+                    hourly_history,
+                    hourly_start_timestamp,
+                    target_timestamp,
+                )
+                history = add_high_low_order_to_parent_candles(
+                    parent_candles=history,
+                    hourly_candles=hourly_candles,
+                    timeframe=timeframe,
+                    target_timestamp=target_timestamp,
+                )
+
+            output[asset.response_key] = TradingViewPriceData(
+                symbol=asset.symbol,
+                pair=asset.pair,
+                exchange=asset.exchange or None,
+                bias=asset.bias,
+                timeframe=timeframe,
+                candle_type=candle_type,
+                start_date=parsed_start_date,
+                end_date=parsed_end_date,
+                range=candle_range,
+                to=target_timestamp,
+                count=len(history),
+                history=history,
+                hourly_range=hourly_range,
+                hourly_to=hourly_to,
+                hourly_count=len(hourly_candles),
+                hourly_candles=hourly_candles,
+            )
+
+    return output
+
+
 
 @router.get(
     "/price-data",
@@ -958,20 +1288,28 @@ async def get_price_data(
             )
         ),
     ] = False,
+    request_delay_seconds: Annotated[
+        float | None,
+        Query(
+            ge=0,
+            description=(
+                "Optional delay between upstream TradingView price requests. "
+                "Defaults to TRADINGVIEW_PRICE_REQUEST_DELAY_SECONDS."
+            ),
+        ),
+    ] = None,
 ) -> dict[str, TradingViewPriceData]:
-    headers = get_tradingview_headers()
-    base_url = str(settings.tradingview_api_base_url).rstrip("/")
     query_params = request.query_params
-    parsed_assets = assets or query_params.getlist("assets[]")
+    raw_assets = assets or query_params.getlist("assets[]")
 
-    if not parsed_assets:
-        parsed_assets = [
+    if not raw_assets:
+        raw_assets = [
             value
             for key, value in query_params.multi_items()
             if key.startswith("assets[")
         ]
 
-    if not parsed_assets:
+    if not raw_assets:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one assets query parameter is required.",
@@ -992,146 +1330,162 @@ async def get_price_data(
             detail="Either ed or end_date is required.",
         )
 
-    try:
-        candle_range = calculate_candles_range(
-            parsed_start_date,
-            parsed_end_date,
-            timeframe,
-        )
-        start_timestamp = start_date_to_target_timestamp(parsed_start_date)
-        target_timestamp = end_date_to_target_timestamp(parsed_end_date)
-    except ValueError as exc:
+    return await get_price_data_for_assets(
+        parsed_assets=parse_query_price_assets(raw_assets),
+        timeframe=timeframe,
+        candle_type=candle_type,
+        parsed_start_date=parsed_start_date,
+        parsed_end_date=parsed_end_date,
+        include_hourly_candles=include_hourly_candles,
+        request_delay_seconds=request_delay_seconds,
+    )
+
+
+@router.post(
+    "/price-data",
+    summary="Get TradingView price candles for configured symbols and exchanges.",
+    response_model=TradingViewPriceDataResponse,
+)
+async def post_price_data(
+    payload: TradingViewPriceDataRequest,
+) -> TradingViewPriceDataResponse:
+    if not payload.assets:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
+            detail="At least one asset is required.",
+        )
 
-    output: dict[str, TradingViewPriceData] = {}
+    parsed_start_date = payload.sd or payload.start_date
+    parsed_end_date = payload.ed or payload.end_date
 
-    async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
-        for asset in parsed_assets:
-            history = await fetch_tradingview_price_history(
-                client=client,
-                base_url=base_url,
-                headers=headers,
-                asset=asset,
-                timeframe=timeframe,
-                candle_type=candle_type,
-                candle_range=candle_range,
-                target_timestamp=target_timestamp,
-            )
+    if not parsed_start_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either sd or start_date is required.",
+        )
 
-            hourly_candles = []
-            hourly_to = None
-            hourly_range = None
+    if not parsed_end_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either ed or end_date is required.",
+        )
 
-            # get hourly candles if included
-            if include_hourly_candles:
-                hourly_to = target_timestamp
-                parent_candle_times = [
-                    candle_time
-                    for candle in history
-                    if (candle_time := get_candle_time(candle)) is not None
-                ]
-                hourly_start_timestamp = (
-                    min(parent_candle_times) if parent_candle_times else start_timestamp
-                )
-                hourly_range = calculate_hourly_range_from_timestamps(
-                    hourly_start_timestamp,
-                    target_timestamp,
-                )
-                hourly_history = await fetch_tradingview_price_history(
-                    client=client,
-                    base_url=base_url,
-                    headers=headers,
-                    asset=asset,
-                    timeframe="60",
-                    candle_type=candle_type,
-                    candle_range=hourly_range,
-                    target_timestamp=target_timestamp,
-                )
-                hourly_candles = filter_candles_to_timestamp_range(
-                    hourly_history,
-                    hourly_start_timestamp,
-                    target_timestamp,
-                )
-                history = add_high_low_order_to_parent_candles(
-                    parent_candles=history,
-                    hourly_candles=hourly_candles,
-                    timeframe=timeframe,
-                    target_timestamp=target_timestamp,
-                )
+    price_data = await get_price_data_for_assets(
+        parsed_assets=parse_body_price_assets(payload.assets),
+        timeframe=normalize_price_data_timeframe(payload.timeframe),
+        candle_type=payload.candle_type,
+        parsed_start_date=parsed_start_date,
+        parsed_end_date=parsed_end_date,
+        include_hourly_candles=payload.include_hourly_candles,
+        request_delay_seconds=payload.request_delay_seconds,
+    )
 
-            output[asset] = TradingViewPriceData(
-                symbol=asset,
-                timeframe=timeframe,
-                candle_type=candle_type,
-                start_date=parsed_start_date,
-                end_date=parsed_end_date,
-                range=candle_range,
-                to=target_timestamp,
-                count=len(history),
-                history=history,
-                hourly_range=hourly_range,
-                hourly_to=hourly_to,
-                hourly_count=len(hourly_candles),
-                hourly_candles=hourly_candles,
-            )
-
-    return output
+    return TradingViewPriceDataResponse(price_data=price_data_to_keyed_items(price_data))
 
 
 
+
+
+def is_bullish_potential_setup(
+    prev: TradingViewPriceCandle,
+    curr: TradingViewPriceCandle,
+) -> bool:
+    return curr.close >= curr.open and curr.close >= prev.max
+
+
+def is_bearish_potential_setup(
+    prev: TradingViewPriceCandle,
+    curr: TradingViewPriceCandle,
+) -> bool:
+    return curr.close < curr.open and curr.close <= prev.min
+
+
+def evaluate_bullish_engulfing_case(
+    prev: TradingViewPriceCandle,
+    curr: TradingViewPriceCandle,
+    next_candle: TradingViewPriceCandle,
+) -> bool | None:
+    if not is_bullish_potential_setup(prev, curr):
+        return None
+
+    # Third candle high ran the second candle high and happened before the low occurred.
+    if next_candle.max >= curr.max and next_candle.high_before is True:
+        return True
+
+    # Third candle high ran the second candle high without running the second candle low.
+    if next_candle.max >= curr.max and next_candle.min >= curr.min:
+        return True
+
+    return False
+
+
+def evaluate_bearish_engulfing_case(
+    prev: TradingViewPriceCandle,
+    curr: TradingViewPriceCandle,
+    next_candle: TradingViewPriceCandle,
+) -> bool | None:
+    if not is_bearish_potential_setup(prev, curr):
+        return None
+
+    # Third candle low ran the second candle low and happened before the high occurred.
+    if next_candle.min <= curr.min and next_candle.high_before is False:
+        return True
+
+    # Third candle low ran the second candle low without running the second candle high.
+    if next_candle.min <= curr.min and next_candle.max <= curr.max:
+        return True
+
+    return False
 
 
 def check_bullish_engulfing(
     prev: TradingViewPriceCandle,
     curr: TradingViewPriceCandle,
     next_candle: TradingViewPriceCandle,
-    prev_date: date,
 ) -> bool:
-    # Bullish Case
-    print(f"{prev_date}: ")
-    if curr.close >= curr.open:
-        # Second candle closed above prev high
-        if curr.close >= prev.max:
+    return evaluate_bullish_engulfing_case(prev, curr, next_candle) is True
 
-            # Third candle high ran the second candle high and happened before the low occurred
-            if next_candle.max >= curr.max and next_candle.high_before is True:
-                print("third candle high_before + runs second candle high")
-                return True
-            # Third candle high ran the second candle high; since the low came first,
-            # it didn't run the second candle's low at all.
-            elif next_candle.max >= curr.max and next_candle.min >= curr.min:
-                print("third candle high runs second candle high + low was not ran")
-                return True
-            else:
-                # Check subsequent candles and validate that high eventually ran
-                # before any low of the current candle is hit.
-                print("something else")
-                return False
-        else:
-            print("second candle close above high fail")
-            return False
 
-    # Bearish Case
+def check_bearish_engulfing(
+    prev: TradingViewPriceCandle,
+    curr: TradingViewPriceCandle,
+    next_candle: TradingViewPriceCandle,
+) -> bool:
+    return evaluate_bearish_engulfing_case(prev, curr, next_candle) is True
+
+
+def get_directions_for_bias(bias: BiasType) -> list[AnalysisDirection]:
+    if bias == "Bullish":
+        return ["Bullish"]
+
+    if bias == "Bearish":
+        return ["Bearish"]
+
+    return ["Bullish", "Bearish"]
+
+
+def resolve_analysis_asset(
+    pair_key: str,
+    assets: dict[str, TradingViewAssetRequest],
+    price_data: dict[str, TradingViewPriceData] | list[TradingViewPriceData],
+) -> tuple[str, str | None, str | None, BiasType]:
+    exchange_from_key, pair = parse_symbol_parts(pair_key)
+    asset_config = assets.get(pair_key) or assets.get(pair)
+    asset_price_data = get_price_data_for_analysis_asset(pair_key, pair, price_data)
+
+    if asset_config:
+        exchange = asset_config.exchange.strip().upper()
+        bias = asset_config.bias
+    elif asset_price_data:
+        exchange = asset_price_data.exchange or exchange_from_key
+        bias = asset_price_data.bias
     else:
-        print("bearish case")
-        # Second candle closed below prev low
-        # if curr.close <= prev.min:
+        exchange = exchange_from_key
+        bias = "Both"
 
-        #     # Third candle low ran the second candle low and happened before the high occurred
-        #     if next_candle.min <= curr.min and next_candle.high_before is False:
-        #         return True
-        #     # Third candle low ran the second candle low; since the high came first,
-        #     # it didn't run the second candle's high at all.
-        #     elif next_candle.min <= curr.min and next_candle.max <= curr.max:
-        #         return True
-        #     else:
-        #         return False
-        # else:
-        #     return False
-        return False
+    symbol = build_tradingview_symbol(exchange, pair) if exchange else pair
+
+    return pair, exchange, symbol, bias
 
 
 @router.post(
@@ -1140,55 +1494,117 @@ def check_bullish_engulfing(
     response_model=TradingViewAnalyzeResponse,
 )
 async def analyze_price_data(
-    history: list[TradingViewPriceCandle],
-    analysis_type: AnalysisType,
+    payload: TradingViewAnalyzeRequest,
 ) -> TradingViewAnalyzeResponse:
-    analysis_executions: list[TradingViewAnalysisExecution] = []
-    sorted_history = sorted(history, key=lambda candle: candle.time)
+    histories = payload.histories or payload.history or price_data_to_histories(payload.price_data)
+    if not histories:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one history list is required.",
+        )
 
-    for i in range(1, max(len(sorted_history) - 1, 1)):
-        prev = sorted_history[i - 1]
-        curr = sorted_history[i]
-        next_candle = sorted_history[i + 1]
+    asset_results: dict[str, TradingViewAssetAnalyzeResult] = {}
 
-        prev_date = unix_seconds_to_date(prev.time)
-        curr_date = unix_seconds_to_date(curr.time)
-        next_date = unix_seconds_to_date(next_candle.time)
-        prev_utc_datetime = unix_seconds_to_utc_datetime(prev.time)
-        curr_utc_datetime = unix_seconds_to_utc_datetime(curr.time)
-        next_utc_datetime = unix_seconds_to_utc_datetime(next_candle.time)
-        prev_ny_datetime = unix_seconds_to_ny_datetime(prev.time)
-        curr_ny_datetime = unix_seconds_to_ny_datetime(curr.time)
-        next_ny_datetime = unix_seconds_to_ny_datetime(next_candle.time)
+    for pair_key, history in histories.items():
+        pair, exchange, symbol, bias = resolve_analysis_asset(
+            pair_key,
+            payload.assets,
+            payload.price_data,
+        )
+        sorted_history = sorted(history, key=lambda candle: candle.time)
+        analysis_executions: list[TradingViewAnalysisExecution] = []
 
-        if analysis_type == "Bullish Engulfing":
-            success = check_bullish_engulfing(prev, curr, next_candle, prev_date)
+        for i in range(1, len(sorted_history) - 1):
+            prev = sorted_history[i - 1]
+            curr = sorted_history[i]
+            next_candle = sorted_history[i + 1]
 
-            analysis_executions.append(
-                TradingViewAnalysisExecution(
-                    analysis_type=analysis_type,
-                    success=success,
-                    prev=prev,
-                    curr=curr,
-                    next_candle=next_candle,
-                    prev_date=prev_date,
-                    curr_date=curr_date,
-                    next_date=next_date,
-                    prev_utc_datetime=prev_utc_datetime,
-                    curr_utc_datetime=curr_utc_datetime,
-                    next_utc_datetime=next_utc_datetime,
-                    prev_ny_datetime=prev_ny_datetime,
-                    curr_ny_datetime=curr_ny_datetime,
-                    next_ny_datetime=next_ny_datetime,
+            for direction in get_directions_for_bias(bias):
+                if payload.analysis_type == "Bullish Engulfing" and direction == "Bullish":
+                    success = evaluate_bullish_engulfing_case(prev, curr, next_candle)
+                elif payload.analysis_type == "Bullish Engulfing" and direction == "Bearish":
+                    success = evaluate_bearish_engulfing_case(prev, curr, next_candle)
+                else:
+                    success = None
+
+                if success is None:
+                    continue
+
+                analysis_executions.append(
+                    TradingViewAnalysisExecution(
+                        pair=pair,
+                        exchange=exchange,
+                        symbol=symbol,
+                        bias=bias,
+                        analysis_type=payload.analysis_type,
+                        direction=direction,
+                        success=success,
+                        prev=prev,
+                        curr=curr,
+                        next_candle=next_candle,
+                        prev_date=unix_seconds_to_date(prev.time),
+                        curr_date=unix_seconds_to_date(curr.time),
+                        next_date=unix_seconds_to_date(next_candle.time),
+                    )
                 )
-            )
 
-    success_count = sum(1 for execution in analysis_executions if execution.success)
-    failure_count = len(analysis_executions) - success_count
+        bullish_success_count = sum(
+            1
+            for execution in analysis_executions
+            if execution.direction == "Bullish" and execution.success
+        )
+        bullish_failure_count = sum(
+            1
+            for execution in analysis_executions
+            if execution.direction == "Bullish" and not execution.success
+        )
+        bearish_success_count = sum(
+            1
+            for execution in analysis_executions
+            if execution.direction == "Bearish" and execution.success
+        )
+        bearish_failure_count = sum(
+            1
+            for execution in analysis_executions
+            if execution.direction == "Bearish" and not execution.success
+        )
+
+        asset_results[pair_key] = TradingViewAssetAnalyzeResult(
+            pair=pair,
+            exchange=exchange,
+            symbol=symbol,
+            bias=bias,
+            analysis_type=payload.analysis_type,
+            bullish_success_count=bullish_success_count,
+            bullish_failure_count=bullish_failure_count,
+            bullish_total_count=bullish_success_count + bullish_failure_count,
+            bearish_success_count=bearish_success_count,
+            bearish_failure_count=bearish_failure_count,
+            bearish_total_count=bearish_success_count + bearish_failure_count,
+            total_success_count=bullish_success_count + bearish_success_count,
+            total_failure_count=bullish_failure_count + bearish_failure_count,
+            total_count=len(analysis_executions),
+            analysis_executions=analysis_executions,
+        )
 
     return TradingViewAnalyzeResponse(
-        analysis_type=analysis_type,
-        success_count=success_count,
-        failure_count=failure_count,
-        analysis_executions=analysis_executions,
+        analysis_type=payload.analysis_type,
+        bullish_success_count=sum(
+            result.bullish_success_count for result in asset_results.values()
+        ),
+        bullish_failure_count=sum(
+            result.bullish_failure_count for result in asset_results.values()
+        ),
+        bullish_total_count=sum(result.bullish_total_count for result in asset_results.values()),
+        bearish_success_count=sum(
+            result.bearish_success_count for result in asset_results.values()
+        ),
+        bearish_failure_count=sum(
+            result.bearish_failure_count for result in asset_results.values()
+        ),
+        bearish_total_count=sum(result.bearish_total_count for result in asset_results.values()),
+        total_success_count=sum(result.total_success_count for result in asset_results.values()),
+        total_failure_count=sum(result.total_failure_count for result in asset_results.values()),
+        total_count=sum(result.total_count for result in asset_results.values()),
+        assets=asset_results,
     )

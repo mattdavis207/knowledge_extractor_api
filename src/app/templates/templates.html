@@ -102,6 +102,20 @@
       min-width: 0;
     }
 
+    .bulk-field {
+      flex: 0 1 180px;
+      min-width: 150px;
+    }
+
+    .bulk-field span, .asset-controls span {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
     input[type="search"], input[type="date"], select {
       width: 100%;
       min-height: 42px;
@@ -181,14 +195,32 @@
 
     .asset-option {
       display: grid;
-      grid-template-columns: 18px minmax(0, 1fr);
+      grid-template-columns: minmax(0, 1fr);
       gap: 10px;
-      padding: 10px 14px;
+      padding: 12px 14px;
       border-bottom: 1px solid #edf1f7;
-      cursor: pointer;
+      align-items: start;
     }
 
     .asset-option:hover { background: var(--accent-soft); }
+    .asset-option.selected { background: #fbfdff; }
+
+    .asset-pick {
+      display: grid;
+      grid-template-columns: 18px minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      min-width: 0;
+      cursor: pointer;
+    }
+
+    .asset-pick input {
+      margin-top: 3px;
+    }
+
+    .asset-pick > span {
+      min-width: 0;
+    }
 
     .asset-symbol {
       display: block;
@@ -203,6 +235,34 @@
       color: var(--muted);
       font-size: 0.82rem;
       line-height: 1.35;
+    }
+
+    .asset-controls {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 10px;
+      padding-left: 28px;
+    }
+
+    .asset-controls label {
+      display: grid;
+      min-width: 0;
+      gap: 4px;
+    }
+
+    .asset-controls select {
+      display: block;
+      width: 100%;
+      min-width: 0;
+      min-height: 38px;
+      padding: 7px 9px;
+      font-size: 0.9rem;
+      line-height: 1.2;
+    }
+
+    .asset-controls select:disabled {
+      color: var(--muted);
+      background: #f5f7fb;
     }
 
     .timeframes {
@@ -285,6 +345,7 @@
       main { width: min(100% - 20px, 1120px); padding: 20px 0; }
       header, form { padding-left: 18px; padding-right: 18px; }
       .asset-groups { grid-template-columns: 1fr; }
+      .asset-controls { padding-left: 0; }
       .timeframes { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     }
   </style>
@@ -304,6 +365,20 @@
             <div class="search">
               <input id="assetSearch" type="search" autocomplete="off" placeholder="Search by symbol or name">
             </div>
+            <label class="bulk-field">
+              <span>Default exchange</span>
+              <select id="defaultExchange" disabled>
+                <option value="">Loading...</option>
+              </select>
+            </label>
+            <label class="bulk-field">
+              <span>Default bias</span>
+              <select id="defaultBias">
+                <option value="Both">Both</option>
+                <option value="Bullish">Bullish</option>
+                <option value="Bearish">Bearish</option>
+              </select>
+            </label>
             <div class="actions">
               <button type="button" id="selectVisible">Select All</button>
               <button type="button" id="clearVisible">Clear All</button>
@@ -360,13 +435,26 @@
       "/currency-pairs.json",
       window.location.origin
     ).toString();
+    const EXCHANGES_ENDPOINT = new URL(
+      "/exchanges.json",
+      window.location.origin
+    ).toString();
     const WEBHOOK_PROXY_ENDPOINT = new URL(
       "/analysis-webhook",
       window.location.origin
     ).toString();
     const MAJORS = new Set(["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD"]);
     const MAJOR_CURRENCIES = ["EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"];
-    const state = { assets: [], visible: [], selected: new Set() };
+    const biasOptions = ["Both", "Bullish", "Bearish"];
+    const state = {
+      assets: [],
+      visible: [],
+      selected: new Set(),
+      exchanges: [],
+      defaultExchange: "",
+      defaultBias: "Both",
+      assetConfig: {}
+    };
 
     const timeframes = [
       ["1", "1 Minute"], ["5", "5 Minutes"], ["15", "15 Minutes"],
@@ -396,8 +484,12 @@
       return String(symbol || "").split(":").pop().replace(/[^A-Z]/gi, "").toUpperCase();
     }
 
+    function assetKey(asset) {
+      return tickerFromSymbol(asset.symbol);
+    }
+
     function classifyAsset(asset) {
-      const ticker = tickerFromSymbol(asset.symbol);
+      const ticker = assetKey(asset);
       if (MAJORS.has(ticker)) return "majors";
       const base = ticker.slice(0, 3);
       const quote = ticker.slice(3, 6);
@@ -407,6 +499,43 @@
 
     function labelForAsset(asset) {
       return asset.description || asset.label || asset.symbol;
+    }
+
+    function exchangeLabel(exchange) {
+      return exchange.desc || exchange.name || exchange.value;
+    }
+
+    function getAssetConfig(key) {
+      if (!state.assetConfig[key]) {
+        state.assetConfig[key] = {
+          exchange: state.defaultExchange,
+          bias: state.defaultBias
+        };
+      }
+
+      if (!state.assetConfig[key].exchange) state.assetConfig[key].exchange = state.defaultExchange;
+      if (!state.assetConfig[key].bias) state.assetConfig[key].bias = state.defaultBias;
+      return state.assetConfig[key];
+    }
+
+    function renderExchangeOptions(selectedValue) {
+      if (!state.exchanges.length) return '<option value="">No Forex exchanges loaded</option>';
+      return state.exchanges.map((exchange) => `
+        <option value="${escapeHtml(exchange.value)}" ${exchange.value === selectedValue ? "selected" : ""}>
+          ${escapeHtml(exchangeLabel(exchange))}
+        </option>
+      `).join("");
+    }
+
+    function renderBiasOptions(selectedValue) {
+      return biasOptions.map((bias) => `
+        <option value="${bias}" ${bias === selectedValue ? "selected" : ""}>${bias}</option>
+      `).join("");
+    }
+
+    function renderDefaultExchange() {
+      qs("defaultExchange").innerHTML = renderExchangeOptions(state.defaultExchange);
+      qs("defaultExchange").disabled = !state.exchanges.length;
     }
 
     function renderTimeframes() {
@@ -432,15 +561,36 @@
         <section class="asset-group">
           <h3>${title}<span class="group-count">${grouped[key].length}</span></h3>
           <div class="asset-list">
-            ${grouped[key].map((asset) => `
-              <label class="asset-option">
-                <input type="checkbox" value="${escapeHtml(asset.symbol)}" ${state.selected.has(asset.symbol) ? "checked" : ""}>
-                <span>
-                  <span class="asset-symbol">${escapeHtml(asset.symbol)}</span>
-                  <span class="asset-name">${escapeHtml(labelForAsset(asset))}</span>
-                </span>
-              </label>
-            `).join("")}
+            ${grouped[key].map((asset) => {
+              const key = assetKey(asset);
+              const selected = state.selected.has(key);
+              const config = getAssetConfig(key);
+              return `
+                <div class="asset-option ${selected ? "selected" : ""}">
+                  <label class="asset-pick">
+                    <input type="checkbox" value="${escapeHtml(key)}" ${selected ? "checked" : ""}>
+                    <span>
+                      <span class="asset-symbol">${escapeHtml(key)}</span>
+                      <span class="asset-name">${escapeHtml(labelForAsset(asset))}</span>
+                    </span>
+                  </label>
+                  <div class="asset-controls">
+                    <label>
+                      <span>Exchange</span>
+                      <select data-asset-key="${escapeHtml(key)}" data-config-field="exchange" ${selected ? "" : "disabled"}>
+                        ${renderExchangeOptions(config.exchange)}
+                      </select>
+                    </label>
+                    <label>
+                      <span>Bias</span>
+                      <select data-asset-key="${escapeHtml(key)}" data-config-field="bias" ${selected ? "" : "disabled"}>
+                        ${renderBiasOptions(config.bias)}
+                      </select>
+                    </label>
+                  </div>
+                </div>
+              `;
+            }).join("")}
           </div>
         </section>
       `).join("");
@@ -464,6 +614,29 @@
       }
     }
 
+    async function loadExchanges() {
+      const response = await fetch(EXCHANGES_ENDPOINT);
+      if (!response.ok) throw new Error(`Local exchanges request failed: ${response.status}`);
+      const payload = await response.json();
+      state.exchanges = (payload.exchanges || [])
+        .filter((exchange) => exchange.group === "Forex" && exchange.value)
+        .sort((a, b) => exchangeLabel(a).localeCompare(exchangeLabel(b)));
+
+      const preferredExchange = state.exchanges.find((exchange) => exchange.value === "OANDA");
+      state.defaultExchange = preferredExchange?.value || state.exchanges[0]?.value || "";
+      renderDefaultExchange();
+    }
+
+    async function loadFormData() {
+      try {
+        await loadExchanges();
+        await loadAssets();
+      } catch (error) {
+        qs("assetError").textContent = error.message;
+        qs("assetStatus").textContent = "Form data unavailable";
+      }
+    }
+
     function validateDates() {
       const startDate = qs("startDate").value;
       const endDate = qs("endDate").value;
@@ -475,21 +648,55 @@
     }
 
     qs("assetGroups").addEventListener("change", (event) => {
-      if (event.target.type !== "checkbox") return;
-      if (event.target.checked) state.selected.add(event.target.value);
-      else state.selected.delete(event.target.value);
+      if (event.target.type === "checkbox") {
+        const key = event.target.value;
+        if (event.target.checked) {
+          state.selected.add(key);
+          getAssetConfig(key);
+        } else {
+          state.selected.delete(key);
+        }
+        renderAssets();
+        return;
+      }
+
+      const configField = event.target.dataset.configField;
+      const key = event.target.dataset.assetKey;
+      if (!configField || !key) return;
+
+      getAssetConfig(key)[configField] = event.target.value;
       renderAssets();
     });
 
     qs("assetSearch").addEventListener("input", renderAssets);
 
     qs("selectVisible").addEventListener("click", () => {
-      state.visible.forEach((asset) => state.selected.add(asset.symbol));
+      state.visible.forEach((asset) => {
+        const key = assetKey(asset);
+        state.selected.add(key);
+        getAssetConfig(key);
+      });
       renderAssets();
     });
 
     qs("clearVisible").addEventListener("click", () => {
-      state.visible.forEach((asset) => state.selected.delete(asset.symbol));
+      state.visible.forEach((asset) => state.selected.delete(assetKey(asset)));
+      renderAssets();
+    });
+
+    qs("defaultExchange").addEventListener("change", () => {
+      state.defaultExchange = qs("defaultExchange").value;
+      state.selected.forEach((key) => {
+        getAssetConfig(key).exchange = state.defaultExchange;
+      });
+      renderAssets();
+    });
+
+    qs("defaultBias").addEventListener("change", () => {
+      state.defaultBias = qs("defaultBias").value;
+      state.selected.forEach((key) => {
+        getAssetConfig(key).bias = state.defaultBias;
+      });
       renderAssets();
     });
 
@@ -499,8 +706,19 @@
       if (!state.selected.size || !validateDates()) return;
 
       const timeframeInput = document.querySelector("input[name='timeframe']:checked");
+      const selectedAssetKeys = Array.from(state.selected).sort();
+      const selectedAssets = Object.fromEntries(selectedAssetKeys.map((key) => {
+        const config = getAssetConfig(key);
+        return [
+          key,
+          {
+            exchange: config.exchange,
+            bias: config.bias
+          }
+        ];
+      }));
       const submitted = {
-        assets: Array.from(state.selected),
+        assets: selectedAssets,
         timeframe: {
           label: timeframes.find(([value]) => value === timeframeInput.value)[1],
           query_param: timeframeInput.value
@@ -548,6 +766,12 @@
 
     qs("analysisForm").addEventListener("reset", () => {
       state.selected.clear();
+      state.assetConfig = {};
+      state.defaultBias = "Both";
+      qs("defaultBias").value = state.defaultBias;
+      const preferredExchange = state.exchanges.find((exchange) => exchange.value === "OANDA");
+      state.defaultExchange = preferredExchange?.value || state.exchanges[0]?.value || "";
+      renderDefaultExchange();
       qs("assetSearch").value = "";
       qs("assetError").textContent = "";
       qs("dateError").textContent = "";
@@ -559,7 +783,7 @@
     qs("endDate").addEventListener("change", validateDates);
 
     renderTimeframes();
-    loadAssets();
+    loadFormData();
   </script>
 </body>
 </html>
