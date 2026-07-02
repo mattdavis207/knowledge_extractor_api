@@ -1,7 +1,7 @@
 import asyncio
 import math
 import time
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as datetime_time
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
@@ -19,6 +19,11 @@ AnalysisType = Literal["Bullish Engulfing", "Triple M"]
 PriceCandleType = Literal["Japanese", "HeikinAshi", "Range"]
 BiasType = Literal["Bullish", "Bearish", "Both"]
 AnalysisDirection = Literal["Bullish", "Bearish"]
+AnalysisCaseResult = tuple[bool | None, "TradingViewPriceCandle | None", bool]
+ANALYSIS_CONTEXT_WINDOWS_WEEKS: dict[AnalysisType, tuple[int, int]] = {
+    "Bullish Engulfing": (12, 6),
+    "Triple M": (0, 0),
+}
 
 PRICE_ENDPOINT: str = "/api/price"
 METADATA_EXCHANGES_ENDPOINT: str = "/api/metadata/exchanges"
@@ -162,6 +167,7 @@ class TradingViewPriceDataRequest(BaseModel):
     end_date: str | None = None
     sd: str | None = None
     ed: str | None = None
+    analysis_type: AnalysisType | None = None
     candle_type: PriceCandleType = Field(default="Japanese", alias="type")
     include_hourly_candles: bool = False
     request_delay_seconds: float | None = Field(default=None, ge=0)
@@ -188,6 +194,7 @@ class TradingViewPriceData(BaseModel):
     to: int
     count: int
     history: list[TradingViewPriceCandle]
+    context_history: list[TradingViewPriceCandle] = Field(default_factory=list)
     hourly_range: int | None = None
     hourly_to: int | None = None
     hourly_count: int = 0
@@ -213,6 +220,7 @@ class TradingViewAnalysisExecution(BaseModel):
     analysis_type: AnalysisType
     direction: AnalysisDirection
     success: bool
+    consolidation: bool
     prev: TradingViewPriceCandle
     curr: TradingViewPriceCandle
     next_candle: TradingViewPriceCandle
@@ -277,6 +285,25 @@ def end_date_to_target_timestamp(end_date: str | date | datetime) -> int:
         tzinfo=UTC,
     )
     return int(end_of_day_utc.timestamp())
+
+
+def get_context_date_range(
+    start_date: str | date | datetime,
+    end_date: str | date | datetime,
+    analysis_type: AnalysisType | None,
+) -> tuple[date, date]:
+    parsed_start_date = parse_analysis_date(start_date)
+    parsed_end_date = parse_analysis_date(end_date)
+
+    if analysis_type is None:
+        return parsed_start_date, parsed_end_date
+
+    start_window_weeks, end_window_weeks = ANALYSIS_CONTEXT_WINDOWS_WEEKS[analysis_type]
+    return (
+        parsed_start_date - timedelta(weeks=start_window_weeks),
+        parsed_end_date + timedelta(weeks=end_window_weeks),
+    )
+
 
 def unix_seconds_to_utc_datetime(timestamp: int | float) -> datetime:
     return datetime.fromtimestamp(timestamp, tz=UTC)
@@ -1144,6 +1171,7 @@ async def get_price_data_for_assets(
     candle_type: PriceCandleType,
     parsed_start_date: str,
     parsed_end_date: str,
+    analysis_type: AnalysisType | None,
     include_hourly_candles: bool,
     request_delay_seconds: float | None,
 ) -> dict[str, TradingViewPriceData]:
@@ -1161,8 +1189,20 @@ async def get_price_data_for_assets(
             parsed_end_date,
             timeframe,
         )
+        context_start_date, context_end_date = get_context_date_range(
+            parsed_start_date,
+            parsed_end_date,
+            analysis_type,
+        )
+        context_candle_range = calculate_candles_range(
+            context_start_date,
+            context_end_date,
+            timeframe,
+        )
         start_timestamp = start_date_to_target_timestamp(parsed_start_date)
         target_timestamp = end_date_to_target_timestamp(parsed_end_date)
+        context_start_timestamp = start_date_to_target_timestamp(context_start_date)
+        context_target_timestamp = end_date_to_target_timestamp(context_end_date)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1184,10 +1224,16 @@ async def get_price_data_for_assets(
                 asset=asset.symbol,
                 timeframe=timeframe,
                 candle_type=candle_type,
-                candle_range=candle_range,
-                target_timestamp=target_timestamp,
+                candle_range=context_candle_range,
+                target_timestamp=context_target_timestamp,
             )
             upstream_request_count += 1
+            context_history = history
+            history = filter_candles_to_timestamp_range(
+                context_history,
+                start_timestamp,
+                target_timestamp,
+            )
 
             hourly_candles = []
             hourly_to = None
@@ -1195,18 +1241,18 @@ async def get_price_data_for_assets(
 
             # get hourly candles if included
             if include_hourly_candles:
-                hourly_to = target_timestamp
+                hourly_to = context_target_timestamp
                 parent_candle_times = [
                     candle_time
-                    for candle in history
+                    for candle in context_history
                     if (candle_time := get_candle_time(candle)) is not None
                 ]
                 hourly_start_timestamp = (
-                    min(parent_candle_times) if parent_candle_times else start_timestamp
+                    min(parent_candle_times) if parent_candle_times else context_start_timestamp
                 )
                 hourly_range = calculate_hourly_range_from_timestamps(
                     hourly_start_timestamp,
-                    target_timestamp,
+                    context_target_timestamp,
                 )
                 if upstream_request_count > 0 and delay_seconds > 0:
                     await asyncio.sleep(delay_seconds)
@@ -1219,19 +1265,24 @@ async def get_price_data_for_assets(
                     timeframe="60",
                     candle_type=candle_type,
                     candle_range=hourly_range,
-                    target_timestamp=target_timestamp,
+                    target_timestamp=context_target_timestamp,
                 )
                 upstream_request_count += 1
                 hourly_candles = filter_candles_to_timestamp_range(
                     hourly_history,
                     hourly_start_timestamp,
-                    target_timestamp,
+                    context_target_timestamp,
                 )
-                history = add_high_low_order_to_parent_candles(
-                    parent_candles=history,
+                context_history = add_high_low_order_to_parent_candles(
+                    parent_candles=context_history,
                     hourly_candles=hourly_candles,
                     timeframe=timeframe,
-                    target_timestamp=target_timestamp,
+                    target_timestamp=context_target_timestamp,
+                )
+                history = filter_candles_to_timestamp_range(
+                    context_history,
+                    start_timestamp,
+                    target_timestamp,
                 )
 
             output[asset.response_key] = TradingViewPriceData(
@@ -1247,6 +1298,7 @@ async def get_price_data_for_assets(
                 to=target_timestamp,
                 count=len(history),
                 history=history,
+                context_history=context_history,
                 hourly_range=hourly_range,
                 hourly_to=hourly_to,
                 hourly_count=len(hourly_candles),
@@ -1279,6 +1331,7 @@ async def get_price_data(
     ed: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    analysis_type: AnalysisType | None = None,
     include_hourly_candles: Annotated[
         bool,
         Query(
@@ -1336,6 +1389,7 @@ async def get_price_data(
         candle_type=candle_type,
         parsed_start_date=parsed_start_date,
         parsed_end_date=parsed_end_date,
+        analysis_type=analysis_type,
         include_hourly_candles=include_hourly_candles,
         request_delay_seconds=request_delay_seconds,
     )
@@ -1376,6 +1430,7 @@ async def post_price_data(
         candle_type=payload.candle_type,
         parsed_start_date=parsed_start_date,
         parsed_end_date=parsed_end_date,
+        analysis_type=payload.analysis_type,
         include_hourly_candles=payload.include_hourly_candles,
         request_delay_seconds=payload.request_delay_seconds,
     )
@@ -1404,38 +1459,96 @@ def evaluate_bullish_engulfing_case(
     prev: TradingViewPriceCandle,
     curr: TradingViewPriceCandle,
     next_candle: TradingViewPriceCandle,
-) -> bool | None:
+    sorted_history: list[TradingViewPriceCandle] | None = None,
+    i: int | None = None,
+) -> AnalysisCaseResult:
     if not is_bullish_potential_setup(prev, curr):
-        return None
+        return None, None, False
 
     # Third candle high ran the second candle high and happened before the low occurred.
     if next_candle.max >= curr.max and next_candle.high_before is True:
-        return True
+        return True, None, False
 
     # Third candle high ran the second candle high without running the second candle low.
     if next_candle.max >= curr.max and next_candle.min >= curr.min:
-        return True
+        return True, None, False
 
-    return False
+    # Third candle ran the second candle low before validation, so the setup failed immediately.
+    if next_candle.min < curr.min:
+        return False, None, False
+
+    # Don't check for subsequent consolidation candles without full history context.
+    if sorted_history is None or i is None or i == len(sorted_history) - 2:
+        return False, None, False
+
+    # Third candle did not resolve the setup, so scan subsequent candles until consolidation breaks.
+    j = i + 2
+    while j < len(sorted_history):
+        cons_candle = sorted_history[j]
+
+        # Cons candle high ran the second high candle and happened before the low occurred
+        if cons_candle.max >= curr.max and cons_candle.high_before is True:
+            return True, cons_candle, True
+
+        # Cons candle high ran the second candle high without running the second candle low
+        if cons_candle.max >= curr.max and cons_candle.min >= curr.min:
+            return True, cons_candle, True
+
+        # Cons candle failed the setup
+        if cons_candle.min < curr.min:
+            return False, cons_candle, True
+
+        j += 1
+
+    return False, None, True
 
 
 def evaluate_bearish_engulfing_case(
     prev: TradingViewPriceCandle,
     curr: TradingViewPriceCandle,
     next_candle: TradingViewPriceCandle,
-) -> bool | None:
+    sorted_history: list[TradingViewPriceCandle] | None = None,
+    i: int | None = None,
+) -> AnalysisCaseResult:
     if not is_bearish_potential_setup(prev, curr):
-        return None
+        return None, None, False
 
     # Third candle low ran the second candle low and happened before the high occurred.
     if next_candle.min <= curr.min and next_candle.high_before is False:
-        return True
+        return True, None, False
 
     # Third candle low ran the second candle low without running the second candle high.
     if next_candle.min <= curr.min and next_candle.max <= curr.max:
-        return True
+        return True, None, False
 
-    return False
+    # Third candle ran the second candle high before validation, so the setup failed immediately.
+    if next_candle.max > curr.max:
+        return False, None, False
+
+    # Don't check for subsequent consolidation candles without full history context.
+    if sorted_history is None or i is None or i == len(sorted_history) - 2:
+        return False, None, False
+
+    # Third candle did not resolve the setup, so scan subsequent candles until consolidation breaks.
+    j = i + 2
+    while j < len(sorted_history):
+        cons_candle = sorted_history[j]
+
+        # Cons candle low ran the second candle low and happened before the high occurred.
+        if cons_candle.min <= curr.min and cons_candle.high_before is False:
+            return True, cons_candle, True
+
+        # Cons candle low ran the second candle low without running the second candle high.
+        if cons_candle.min <= curr.min and cons_candle.max <= curr.max:
+            return True, cons_candle, True
+
+        # Cons candle failed the setup by running the second candle high.
+        if cons_candle.max > curr.max:
+            return False, cons_candle, True
+
+        j += 1
+
+    return False, None, True
 
 
 def check_bullish_engulfing(
@@ -1443,7 +1556,8 @@ def check_bullish_engulfing(
     curr: TradingViewPriceCandle,
     next_candle: TradingViewPriceCandle,
 ) -> bool:
-    return evaluate_bullish_engulfing_case(prev, curr, next_candle) is True
+    success, _, _ = evaluate_bullish_engulfing_case(prev, curr, next_candle)
+    return success is True
 
 
 def check_bearish_engulfing(
@@ -1451,7 +1565,8 @@ def check_bearish_engulfing(
     curr: TradingViewPriceCandle,
     next_candle: TradingViewPriceCandle,
 ) -> bool:
-    return evaluate_bearish_engulfing_case(prev, curr, next_candle) is True
+    success, _, _ = evaluate_bearish_engulfing_case(prev, curr, next_candle)
+    return success is True
 
 
 def get_directions_for_bias(bias: BiasType) -> list[AnalysisDirection]:
@@ -1514,16 +1629,47 @@ async def analyze_price_data(
         sorted_history = sorted(history, key=lambda candle: candle.time)
         analysis_executions: list[TradingViewAnalysisExecution] = []
 
+        # loop through 3 candle setup
         for i in range(1, len(sorted_history) - 1):
             prev = sorted_history[i - 1]
             curr = sorted_history[i]
             next_candle = sorted_history[i + 1]
 
             for direction in get_directions_for_bias(bias):
+                execution_next_candle = next_candle
+                consolidation = False
+                # Bullish Engulfing Analysis
                 if payload.analysis_type == "Bullish Engulfing" and direction == "Bullish":
-                    success = evaluate_bullish_engulfing_case(prev, curr, next_candle)
+                    success, replacement_next_candle, consolidation = (
+                        evaluate_bullish_engulfing_case(
+                            prev,
+                            curr,
+                            next_candle,
+                            sorted_history,
+                            i,
+                        )
+                    )
+                    if replacement_next_candle is not None:
+                        execution_next_candle = replacement_next_candle
+                # Bearish Engulfing Analysis
                 elif payload.analysis_type == "Bullish Engulfing" and direction == "Bearish":
-                    success = evaluate_bearish_engulfing_case(prev, curr, next_candle)
+                    success, replacement_next_candle, consolidation = (
+                        evaluate_bearish_engulfing_case(
+                            prev,
+                            curr,
+                            next_candle,
+                            sorted_history,
+                            i,
+                        )
+                    )
+                    if replacement_next_candle is not None:
+                        execution_next_candle = replacement_next_candle
+                # # Bullish Triple M Analysis
+                # elif payload.analysis_type == "Triple M" and direction == "Bullish":
+
+                # # Bearish Triple M Analysis
+                # elif payload.analysis_type == "Triple M" and direction == "Bearish":
+
                 else:
                     success = None
 
@@ -1539,12 +1685,13 @@ async def analyze_price_data(
                         analysis_type=payload.analysis_type,
                         direction=direction,
                         success=success,
+                        consolidation=consolidation,
                         prev=prev,
                         curr=curr,
-                        next_candle=next_candle,
+                        next_candle=execution_next_candle,
                         prev_date=unix_seconds_to_date(prev.time),
                         curr_date=unix_seconds_to_date(curr.time),
-                        next_date=unix_seconds_to_date(next_candle.time),
+                        next_date=unix_seconds_to_date(execution_next_candle.time),
                     )
                 )
 

@@ -527,6 +527,17 @@ def test_price_data_endpoint_accepts_asset_exchange_bias_body(monkeypatch) -> No
                             "high_before": None,
                         }
                     ],
+                    "context_history": [
+                        {
+                            "time": 1716768000,
+                            "open": 1.0,
+                            "close": 1.05,
+                            "max": 1.1,
+                            "min": 0.9,
+                            "volume": 1000,
+                            "high_before": None,
+                        }
+                    ],
                     "hourly_range": None,
                     "hourly_to": None,
                     "hourly_count": 0,
@@ -535,6 +546,100 @@ def test_price_data_endpoint_accepts_asset_exchange_bias_body(monkeypatch) -> No
             }
         ]
     }
+
+
+def test_price_data_endpoint_returns_padded_context_history(monkeypatch) -> None:
+    captured = {}
+    context_history = [
+        {
+            "time": tradingview.start_date_to_target_timestamp("2023-10-23"),
+            "open": 1.0,
+            "close": 1.01,
+            "max": 1.02,
+            "min": 0.99,
+        },
+        {
+            "time": tradingview.start_date_to_target_timestamp("2024-01-15"),
+            "open": 2.0,
+            "close": 2.01,
+            "max": 2.02,
+            "min": 1.99,
+        },
+        {
+            "time": tradingview.start_date_to_target_timestamp("2024-02-05"),
+            "open": 3.0,
+            "close": 3.01,
+            "max": 3.02,
+            "min": 2.99,
+        },
+    ]
+
+    class StubResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {
+                "success": True,
+                "data": {
+                    "history": context_history,
+                },
+            }
+
+    class StubAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            pass
+
+        async def get(self, url: str, headers: dict, params: dict) -> StubResponse:
+            captured["url"] = url
+            captured["params"] = params
+            return StubResponse()
+
+    monkeypatch.setattr(tradingview, "get_tradingview_headers", lambda: {"x-test": "ok"})
+    monkeypatch.setattr(tradingview.httpx, "AsyncClient", StubAsyncClient)
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/api/v1/tradingview/price-data",
+        json={
+            "assets": {
+                "CHFJPY": {
+                    "exchange": "OANDA",
+                    "bias": "Bullish",
+                }
+            },
+            "timeframe": "W",
+            "start_date": "2024-01-15",
+            "end_date": "2024-01-28",
+            "analysis_type": "Bullish Engulfing",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["url"].endswith("/api/price/OANDA%3ACHFJPY")
+    assert captured["params"] == {
+        "timeframe": "W",
+        "type": "Japanese",
+        "range": tradingview.calculate_candles_range(
+            "2023-10-23",
+            "2024-03-10",
+            "W",
+        ),
+        "to": tradingview.end_date_to_target_timestamp("2024-03-10"),
+    }
+    asset = response.json()["price_data"][0]["CHFJPY"]
+    assert [candle["time"] for candle in asset["history"]] == [
+        tradingview.start_date_to_target_timestamp("2024-01-15")
+    ]
+    assert [candle["time"] for candle in asset["context_history"]] == [
+        candle["time"] for candle in context_history
+    ]
 
 
 def test_price_data_endpoint_delays_between_upstream_requests(monkeypatch) -> None:
@@ -780,7 +885,8 @@ def test_price_data_endpoint_fetches_hourly_from_first_parent_candle(monkeypatch
         "range": 504,
         "to": 1705276799,
     }
-    assert response.json()["FX_IDC:CHFJPY"]["history"][0]["high_before"] is False
+    assert response.json()["FX_IDC:CHFJPY"]["history"] == []
+    assert response.json()["FX_IDC:CHFJPY"]["context_history"][0]["high_before"] is False
 
 
 def test_price_data_endpoint_keeps_unknown_high_before_field(monkeypatch) -> None:
@@ -939,12 +1045,14 @@ def test_analyze_price_data_returns_case_executions_and_totals() -> None:
     assert asset["total_count"] == 2
     assert len(executions) == 2
     assert executions[0]["success"] is True
+    assert executions[0]["consolidation"] is False
     assert executions[0]["direction"] == "Bullish"
     assert executions[0]["analysis_type"] == "Bullish Engulfing"
     assert executions[0]["prev"] == {**history[0], "high_before": None}
     assert executions[0]["curr"] == {**history[1], "high_before": None}
     assert executions[0]["next_candle"] == history[2]
     assert executions[1]["success"] is False
+    assert executions[1]["consolidation"] is False
     assert executions[1]["direction"] == "Bullish"
 
 
@@ -1134,9 +1242,210 @@ def test_analyze_price_data_sorts_history_chronologically() -> None:
     assert execution["prev_date"] == "2024-01-01"
     assert execution["curr_date"] == "2024-01-02"
     assert execution["next_date"] == "2024-01-03"
+    assert execution["consolidation"] is False
     assert "prev_utc_datetime" not in execution
     assert "prev_ny_datetime" not in execution
     assert execution["success"] is True
+
+
+def test_analyze_price_data_uses_replacement_next_candle_from_consolidation() -> None:
+    client = TestClient(create_app())
+    history = [
+        {
+            "time": 1704067200,
+            "open": 9.0,
+            "close": 8.0,
+            "max": 10.0,
+            "min": 7.0,
+        },
+        {
+            "time": 1704153600,
+            "open": 8.0,
+            "close": 11.0,
+            "max": 12.0,
+            "min": 7.5,
+        },
+        {
+            "time": 1704240000,
+            "open": 11.0,
+            "close": 11.3,
+            "max": 11.5,
+            "min": 8.0,
+        },
+        {
+            "time": 1704326400,
+            "open": 11.3,
+            "close": 12.2,
+            "max": 12.5,
+            "min": 8.1,
+            "high_before": True,
+        },
+    ]
+
+    response = client.post(
+        "/api/v1/tradingview/analyze",
+        json={
+            "analysis_type": "Bullish Engulfing",
+            "assets": {"CHFJPY": {"exchange": "OANDA", "bias": "Bullish"}},
+            "histories": {"CHFJPY": history},
+        },
+    )
+
+    assert response.status_code == 200
+    execution = response.json()["assets"]["CHFJPY"]["analysis_executions"][0]
+    assert execution["success"] is True
+    assert execution["consolidation"] is True
+    assert execution["next_candle"] == {**history[3], "volume": None}
+    assert execution["next_date"] == "2024-01-04"
+
+
+def test_analyze_price_data_flags_failed_consolidation() -> None:
+    client = TestClient(create_app())
+    history = [
+        {
+            "time": 1704067200,
+            "open": 9.0,
+            "close": 8.0,
+            "max": 10.0,
+            "min": 7.0,
+        },
+        {
+            "time": 1704153600,
+            "open": 8.0,
+            "close": 11.0,
+            "max": 12.0,
+            "min": 7.5,
+        },
+        {
+            "time": 1704240000,
+            "open": 11.0,
+            "close": 11.2,
+            "max": 11.5,
+            "min": 8.0,
+        },
+        {
+            "time": 1704326400,
+            "open": 11.2,
+            "close": 8.0,
+            "max": 11.8,
+            "min": 7.0,
+        },
+    ]
+
+    response = client.post(
+        "/api/v1/tradingview/analyze",
+        json={
+            "analysis_type": "Bullish Engulfing",
+            "assets": {"CHFJPY": {"exchange": "OANDA", "bias": "Bullish"}},
+            "histories": {"CHFJPY": history},
+        },
+    )
+
+    assert response.status_code == 200
+    execution = response.json()["assets"]["CHFJPY"]["analysis_executions"][0]
+    assert execution["success"] is False
+    assert execution["consolidation"] is True
+    assert execution["next_candle"] == {**history[3], "volume": None, "high_before": None}
+    assert execution["next_date"] == "2024-01-04"
+
+
+def test_bullish_engulfing_third_candle_low_break_invalidates_without_consolidation() -> None:
+    prev = tradingview.TradingViewPriceCandle(
+        time=1751835600,
+        open=181.70499999999998,
+        close=185.01,
+        max=185.14499999999998,
+        min=181.642,
+        volume=1016892,
+        high_before=False,
+    )
+    curr = tradingview.TradingViewPriceCandle(
+        time=1752440400,
+        open=184.528,
+        close=185.583,
+        max=186.037,
+        min=184.31199999999998,
+        volume=1089416,
+        high_before=True,
+    )
+    next_candle = tradingview.TradingViewPriceCandle(
+        time=1753045200,
+        open=185.583,
+        close=185.534,
+        max=185.799,
+        min=183.879,
+        volume=1091380,
+        high_before=False,
+    )
+    later_candle = tradingview.TradingViewPriceCandle(
+        time=1753650000,
+        open=185.496,
+        close=183.219,
+        max=186.034,
+        min=182.659,
+        volume=1300521,
+        high_before=True,
+    )
+
+    assert tradingview.evaluate_bullish_engulfing_case(
+        prev,
+        curr,
+        next_candle,
+        [prev, curr, next_candle, later_candle],
+        1,
+    ) == (False, None, False)
+
+
+def test_analyze_price_data_uses_bearish_replacement_next_candle_from_consolidation() -> None:
+    client = TestClient(create_app())
+    history = [
+        {
+            "time": 1704067200,
+            "open": 10.0,
+            "close": 9.5,
+            "max": 11.0,
+            "min": 9.0,
+        },
+        {
+            "time": 1704153600,
+            "open": 9.5,
+            "close": 8.5,
+            "max": 10.0,
+            "min": 8.0,
+        },
+        {
+            "time": 1704240000,
+            "open": 8.5,
+            "close": 8.3,
+            "max": 9.8,
+            "min": 8.2,
+        },
+        {
+            "time": 1704326400,
+            "open": 8.3,
+            "close": 7.8,
+            "max": 9.9,
+            "min": 7.5,
+            "high_before": False,
+        },
+    ]
+
+    response = client.post(
+        "/api/v1/tradingview/analyze",
+        json={
+            "analysis_type": "Bullish Engulfing",
+            "assets": {"EURUSD": {"exchange": "OANDA", "bias": "Bearish"}},
+            "histories": {"EURUSD": history},
+        },
+    )
+
+    assert response.status_code == 200
+    execution = response.json()["assets"]["EURUSD"]["analysis_executions"][0]
+    assert execution["success"] is True
+    assert execution["consolidation"] is True
+    assert execution["direction"] == "Bearish"
+    assert execution["next_candle"] == {**history[3], "volume": None}
+    assert execution["next_date"] == "2024-01-04"
 
 
 def test_bearish_engulfing_requires_known_low_first_when_both_sides_run() -> None:
@@ -1164,6 +1473,46 @@ def test_bearish_engulfing_requires_known_low_first_when_both_sides_run() -> Non
     )
 
     assert tradingview.check_bearish_engulfing(prev, curr, next_candle) is False
+
+
+def test_bearish_engulfing_third_candle_high_break_invalidates_without_consolidation() -> None:
+    prev = tradingview.TradingViewPriceCandle(
+        time=1704067200,
+        open=10.0,
+        close=9.5,
+        max=11.0,
+        min=9.0,
+    )
+    curr = tradingview.TradingViewPriceCandle(
+        time=1704153600,
+        open=9.5,
+        close=8.5,
+        max=10.0,
+        min=8.0,
+    )
+    next_candle = tradingview.TradingViewPriceCandle(
+        time=1704240000,
+        open=8.5,
+        close=9.8,
+        max=10.5,
+        min=8.2,
+    )
+    later_candle = tradingview.TradingViewPriceCandle(
+        time=1704326400,
+        open=9.8,
+        close=7.8,
+        max=9.9,
+        min=7.5,
+        high_before=False,
+    )
+
+    assert tradingview.evaluate_bearish_engulfing_case(
+        prev,
+        curr,
+        next_candle,
+        [prev, curr, next_candle, later_candle],
+        1,
+    ) == (False, None, False)
 
 
 def test_bearish_engulfing_accepts_known_low_first_when_both_sides_run() -> None:
@@ -1243,7 +1592,11 @@ def test_engulfing_evaluator_skips_non_potential_setups() -> None:
         min=6.0,
     )
 
-    assert tradingview.evaluate_bullish_engulfing_case(prev, curr, next_candle) is None
+    assert tradingview.evaluate_bullish_engulfing_case(prev, curr, next_candle) == (
+        None,
+        None,
+        False,
+    )
 
 
 def test_high_low_order_handles_newest_first_parent_candles() -> None:
