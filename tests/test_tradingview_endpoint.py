@@ -1132,6 +1132,15 @@ def test_analyze_price_data_accepts_price_data_output_as_history_source() -> Non
                         "to": 1705795199,
                         "count": 3,
                         "history": history,
+                        "context_history": [
+                            {
+                                "time": 1703462400,
+                                "open": 7.0,
+                                "close": 7.5,
+                                "max": 8.0,
+                                "min": 6.5,
+                            }
+                        ],
                     }
                 }
             ],
@@ -1144,6 +1153,94 @@ def test_analyze_price_data_accepts_price_data_output_as_history_source() -> Non
     assert asset["bias"] == "Bullish"
     assert asset["bullish_success_count"] == 1
     assert asset["total_count"] == 1
+    assert asset["context_history"] == []
+
+
+def test_analysis_screenshots_loops_assets_and_executions() -> None:
+    client = TestClient(create_app())
+    context_history = [
+        {
+            "time": 1704067200,
+            "open": 9.0,
+            "close": 8.0,
+            "max": 10.0,
+            "min": 7.0,
+        }
+    ]
+    execution = {
+        "pair": "AUDUSD",
+        "exchange": "FX",
+        "symbol": "FX:AUDUSD",
+        "bias": "Bearish",
+        "analysis_type": "Bullish Engulfing",
+        "direction": "Bearish",
+        "success": True,
+        "consolidation": False,
+        "prev": context_history[0],
+        "curr": {
+            "time": 1704153600,
+            "open": 9.5,
+            "close": 8.5,
+            "max": 10.0,
+            "min": 8.0,
+        },
+        "next_candle": {
+            "time": 1704240000,
+            "open": 8.5,
+            "close": 9.0,
+            "max": 10.5,
+            "min": 7.5,
+            "high_before": False,
+        },
+        "prev_date": "2024-01-01",
+        "curr_date": "2024-01-02",
+        "next_date": "2024-01-03",
+    }
+
+    response = client.post(
+        "/api/v1/tradingview/analysis-screenshots",
+        json={
+            "analysis_type": "Bullish Engulfing",
+            "bullish_success_count": 0,
+            "bullish_failure_count": 0,
+            "bullish_total_count": 0,
+            "bearish_success_count": 1,
+            "bearish_failure_count": 0,
+            "bearish_total_count": 1,
+            "total_success_count": 1,
+            "total_failure_count": 0,
+            "total_count": 1,
+            "assets": {
+                "AUDUSD": {
+                    "pair": "AUDUSD",
+                    "exchange": "FX",
+                    "symbol": "FX:AUDUSD",
+                    "bias": "Bearish",
+                    "analysis_type": "Bullish Engulfing",
+                    "bullish_success_count": 0,
+                    "bullish_failure_count": 0,
+                    "bullish_total_count": 0,
+                    "bearish_success_count": 1,
+                    "bearish_failure_count": 0,
+                    "bearish_total_count": 1,
+                    "total_success_count": 1,
+                    "total_failure_count": 0,
+                    "total_count": 1,
+                    "context_history": context_history,
+                    "analysis_executions": [execution],
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    asset = data["assets"]["AUDUSD"]
+    assert data["analysis_type"] == "Bullish Engulfing"
+    assert data["bearish_success_count"] == 1
+    assert asset["context_history"][0]["time"] == 1704067200
+    assert asset["analysis_executions"][0]["screenshot_url"] is None
+    assert asset["analysis_executions"][0]["screenshot_error"] is None
 
 
 def test_analyze_price_data_respects_bearish_bias() -> None:

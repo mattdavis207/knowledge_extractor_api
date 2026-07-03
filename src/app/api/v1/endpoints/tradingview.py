@@ -1,18 +1,37 @@
 import asyncio
+import io
 import math
 import time
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as datetime_time
 from typing import Annotated, Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
+# Data libraries
+import cloudinary.uploader
 import httpx
+import mplfinance as mpf
+import pandas as pd
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import settings
 
 router = APIRouter()
+
+
+def configure_cloudinary() -> None:
+    if not settings.cloudinary_url:
+        raise ValueError("CLOUDINARY_URL is not configured")
+
+    parsed = urlparse(settings.cloudinary_url)
+
+    cloudinary.config(
+        cloud_name=parsed.hostname,
+        api_key=parsed.username,
+        api_secret=parsed.password,
+        secure=True,
+    )
 
 CurrencyPairAssetClass = Literal["forex", "futures"]
 AnalysisType = Literal["Bullish Engulfing", "Triple M"]
@@ -22,6 +41,10 @@ AnalysisDirection = Literal["Bullish", "Bearish"]
 AnalysisCaseResult = tuple[bool | None, "TradingViewPriceCandle | None", bool]
 ANALYSIS_CONTEXT_WINDOWS_WEEKS: dict[AnalysisType, tuple[int, int]] = {
     "Bullish Engulfing": (12, 6),
+    "Triple M": (0, 0),
+}
+SCREENSHOT_PADDING_WINDOW_WEEKS: dict[AnalysisType, tuple[int, int]] = {
+    "Bullish Engulfing": (10, 5),
     "Triple M": (0, 0),
 }
 
@@ -227,6 +250,8 @@ class TradingViewAnalysisExecution(BaseModel):
     prev_date: date
     curr_date: date
     next_date: date
+    screenshot_url: str | None = None
+    screenshot_error: str | None = None
 
 
 class TradingViewAnalyzeRequest(BaseModel):
@@ -252,6 +277,7 @@ class TradingViewAssetAnalyzeResult(BaseModel):
     total_success_count: int = 0
     total_failure_count: int = 0
     total_count: int = 0
+    context_history: list[TradingViewPriceCandle] = Field(default_factory=list)
     analysis_executions: list[TradingViewAnalysisExecution]
 
 
@@ -1582,7 +1608,7 @@ def get_directions_for_bias(bias: BiasType) -> list[AnalysisDirection]:
 def resolve_analysis_asset(
     pair_key: str,
     assets: dict[str, TradingViewAssetRequest],
-    price_data: dict[str, TradingViewPriceData] | list[TradingViewPriceData],
+    price_data: PriceDataInput,
 ) -> tuple[str, str | None, str | None, BiasType]:
     exchange_from_key, pair = parse_symbol_parts(pair_key)
     asset_config = assets.get(pair_key) or assets.get(pair)
@@ -1601,6 +1627,121 @@ def resolve_analysis_asset(
     symbol = build_tradingview_symbol(exchange, pair) if exchange else pair
 
     return pair, exchange, symbol, bias
+
+
+def upload_chart_image(buffer: io.BytesIO, public_id: str) -> str:
+    configure_cloudinary()
+
+    result = cloudinary.uploader.upload(
+        buffer,
+        resource_type="image",
+        folder="tradingview-analysis",
+        public_id=public_id,
+        overwrite=True,
+    )
+
+    return result["secure_url"]
+
+
+def plot_to_png_buffer(data, prev_date, next_date) -> io.BytesIO:
+    buffer = io.BytesIO()
+
+    kwargs = dict(
+        type="candle",
+        volume=True,
+        savefig={
+            "fname": buffer,
+            "format": "png",
+            "dpi": 150,
+            "bbox_inches": "tight",
+        },
+        datetime_format="%Y-%m-%d",
+        vlines=dict(vlines=[prev_date, next_date],linewidths=(2,2))
+    )
+
+    mpf.plot(
+        data,
+        **kwargs,
+        style="charles",
+    )
+
+    buffer.seek(0)
+    return buffer
+
+
+def transform_candles_to_dataframe(
+    candles : list[TradingViewPriceCandle]
+):
+    rows = []
+    for candle in candles:
+        rows.append({
+            "Date": pd.to_datetime(candle.time, unit="s", utc=True),
+            "Open": candle.open,
+            "High": candle.max,
+            "Low": candle.min,
+            "Close": candle.close,
+            "Volume": candle.volume or 0,
+        })
+
+    df = pd.DataFrame(rows)
+    df = df.set_index("Date")
+
+    return df
+
+
+def generate_screenshot_url(
+    asset: TradingViewAssetAnalyzeResult,
+    execution: TradingViewAnalysisExecution,
+) -> str | None:
+
+    # extract execution bound times
+    prev_date_unix_seconds = execution.prev.time
+    next_date_unix_seconds = execution.next_candle.time
+
+    analysis_type = asset.analysis_type
+    context_history = sorted(asset.context_history, key=lambda candle: candle.time)
+
+    # calculate padded start_date and end_date
+    start_window_weeks, end_window_weeks = SCREENSHOT_PADDING_WINDOW_WEEKS[analysis_type]
+    padded_start_date = prev_date_unix_seconds - (604800 * start_window_weeks)
+    padded_end_date = next_date_unix_seconds + (604800 * end_window_weeks)
+    
+    start_index = next(
+        (i for i, history_item in enumerate(context_history)
+        if history_item.time >= padded_start_date),
+        0,
+    )
+
+    end_index = next(
+        (i for i, history_item in reversed(list(enumerate(context_history)))
+        if history_item.time <= padded_end_date),
+        len(context_history) - 1,
+    )
+    
+    # slice the range of candles
+    context_window = context_history[start_index: end_index+1]
+
+    # transform data
+    data = transform_candles_to_dataframe(context_window)
+
+    prev_date = execution.prev_date.strftime("%Y-%m-%d")
+    next_date = execution.next_date.strftime("%Y-%m-%d")
+
+    # plot and save image to cloudinary
+    buffer = plot_to_png_buffer(data, prev_date, next_date)
+    public_id = f"{asset.pair}_{execution.direction}_{execution.curr.time}"
+    
+    return upload_chart_image(buffer, public_id)
+
+
+def add_screenshot_urls_to_analysis(
+    payload: TradingViewAnalyzeResponse,
+) -> TradingViewAnalyzeResponse:
+    for asset in payload.assets.values():
+        for execution in asset.analysis_executions:
+            execution.screenshot_url = generate_screenshot_url(asset, execution)
+
+    return payload
 
 
 @router.post(
@@ -1666,10 +1807,30 @@ async def analyze_price_data(
                         execution_next_candle = replacement_next_candle
                 # # Bullish Triple M Analysis
                 # elif payload.analysis_type == "Triple M" and direction == "Bullish":
-
+                #     success, replacement_next_candle, consolidation = (
+                #         evaluate_bullish_triple_m_case(
+                #             prev,
+                #             curr,
+                #             next_candle,
+                #             sorted_history,
+                #             i
+                #         )
+                #     )
+                #     if replacement_next_candle is not None:
+                #         execution_next_candle = replacement_next_candle
                 # # Bearish Triple M Analysis
                 # elif payload.analysis_type == "Triple M" and direction == "Bearish":
-
+                #     success, replacement_next_candle, consolidation = (
+                #         evaluate_bearish_triple_m_case(
+                #             prev,
+                #             curr,
+                #             next_candle,
+                #             sorted_history,
+                #             i
+                #         )
+                #     )
+                #     if replacement_next_candle is not None:
+                #         execution_next_candle = replacement_next_candle
                 else:
                     success = None
 
@@ -1755,3 +1916,16 @@ async def analyze_price_data(
         total_count=sum(result.total_count for result in asset_results.values()),
         assets=asset_results,
     )
+
+@router.post(
+    "/analysis-screenshots",
+    summary=(
+        "Generate setup view screenshots for every analysis execution using "
+        "mplfinance python library"
+    ),
+    response_model=TradingViewAnalyzeResponse,
+)
+async def generate_screenshots(
+    payload: TradingViewAnalyzeResponse,
+) -> TradingViewAnalyzeResponse:
+    return add_screenshot_urls_to_analysis(payload)

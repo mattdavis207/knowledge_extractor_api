@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     youtube_webshare_proxy_locations: str | None = None
     youtube_http_proxy_url: str | None = None
     youtube_https_proxy_url: str | None = None
+    cloudinary_url: str | None = None 
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
