@@ -735,17 +735,145 @@ async def post_price_data(
     return TradingViewPriceDataResponse(price_data=price_data_to_keyed_items(price_data))
 
 
+def is_bullish_potential_setup_tm(
+    prev: TradingViewPriceCandle,
+    curr: TradingViewPriceCandle,
+) -> bool:
+    # candle 2 runs candle 1's low and closes within candle 1's range (non-inclusive lower bound)
+    return curr.min < prev.min and (prev.min < curr.close <= prev.max)
+
+
+def is_bearish_potential_setup_tm(
+    prev: TradingViewPriceCandle,
+    curr: TradingViewPriceCandle,
+) -> bool:
+    # candle 2 runs candle 1's high and closes within candle 1's range (non-inclusive upper bound)
+    return curr.max > prev.max and (prev.min <= curr.close < prev.max)
+
+
+def evaluate_bullish_triple_m_case(
+    prev: TradingViewPriceCandle,
+    curr: TradingViewPriceCandle,
+    next_candle: TradingViewPriceCandle,
+    sorted_history: list[TradingViewPriceCandle] | None = None,
+    i: int | None = None
+) -> AnalysisCaseResult:
+    if not is_bullish_potential_setup_tm(prev, curr):
+        return None, None, False
+    
+    target = prev.min + ((prev.max- prev.min) / 2)
+
+    # Determine target
+
+    # Scenario 1: candle 2 did not hit %50 of candle 1, target is still %50 of candle 1 
+    if curr.max <= target:
+        pass
+    
+    # Scenario 2: candle 2 already hit %50 of candle 1, target is high of candle 2
+    elif curr.max > target: 
+        target = curr.max
+    
+
+    # candle 3 hit the target and high came first.
+    if next_candle.max > target and next_candle.high_before is True:
+        return True, None, False
+    # candle 3 hit the target and did not hit low of candle 2 (even though low came first)
+    if next_candle.max > target and next_candle.min >= curr.min:
+        return True, None, False 
+     # candle 3 ran the second candle low before validation, so the setup failed immediately.
+    if next_candle.min < curr.min:
+        return False, None, False
+    
+    # Don't check for subsequent consolidation candles without full history context.
+    if sorted_history is None or i is None or i == len(sorted_history) - 2:
+        return False, None, False
+    
+     # Third candle did not resolve the setup, so scan subsequent candles until consolidation breaks.
+    j = i + 2
+    while j < len(sorted_history):
+        cons_candle = sorted_history[j]
+
+        # Cons candle high hit the target and high came first.
+        if cons_candle.max > target and cons_candle.high_before is True:
+            return True, cons_candle, True
+        # Cons candle hit the target and did not hit low of candle 2 (even though low came first)
+        if cons_candle.max > target and cons_candle.min >= curr.min:
+            return True, cons_candle, True
+        # Cons candle failed the setup
+        if cons_candle.min < curr.min:
+            return False, cons_candle, True
+
+        j += 1
+
+    return False, None, True
 
 
 
-def is_bullish_potential_setup(
+def evaluate_bearish_triple_m_case(
+    prev: TradingViewPriceCandle,
+    curr: TradingViewPriceCandle,
+    next_candle: TradingViewPriceCandle,
+    sorted_history: list[TradingViewPriceCandle] | None = None,
+    i: int | None = None
+) -> AnalysisCaseResult:
+    if not is_bearish_potential_setup_tm(prev, curr):
+        return None, None, False
+
+    target = prev.min + ((prev.max- prev.min) / 2)
+
+    # Determine target
+
+    # Scenario 1: candle 2 did not hit %50 of candle 1, target is still %50 of candle 1 
+    if curr.min >= target:
+        pass
+    
+    # Scenario 2: candle 2 already hit %50 of candle 1, target is high of candle 2
+    elif curr.min < target: 
+        target = curr.min
+    
+
+    # candle 3 hit the target and low came first.
+    if next_candle.min < target and next_candle.high_before is False:
+        return True, None, False
+    # candle 3 hit the target and did not hit high of candle 2 (even though high came first)
+    if next_candle.min < target and next_candle.max <= curr.max:
+        return True, None, False 
+     # candle 3 ran the second candle high before validation, so the setup failed immediately.
+    if next_candle.max > curr.max:
+        return False, None, False
+    
+    # Don't check for subsequent consolidation candles without full history context.
+    if sorted_history is None or i is None or i == len(sorted_history) - 2:
+        return False, None, False
+    
+     # Third candle did not resolve the setup, so scan subsequent candles until consolidation breaks.
+    j = i + 2
+    while j < len(sorted_history):
+        cons_candle = sorted_history[j]
+
+        # Cons candle hit the target and low came first.
+        if cons_candle.min < target and cons_candle.high_before is False:
+            return True, cons_candle, True
+        # Cons candle hit the target and did not hit high of candle 2 (even though high came first)
+        if cons_candle.min < target and cons_candle.max <= curr.max:
+            return True, cons_candle, True
+        # Cons candle failed the setup
+        if cons_candle.max > curr.max:
+            return False, cons_candle, True
+
+        j += 1
+
+    return False, None, True
+
+
+def is_bullish_potential_setup_en(
     prev: TradingViewPriceCandle,
     curr: TradingViewPriceCandle,
 ) -> bool:
     return curr.close >= curr.open and curr.close >= prev.max
 
 
-def is_bearish_potential_setup(
+def is_bearish_potential_setup_en(
     prev: TradingViewPriceCandle,
     curr: TradingViewPriceCandle,
 ) -> bool:
@@ -759,7 +887,7 @@ def evaluate_bullish_engulfing_case(
     sorted_history: list[TradingViewPriceCandle] | None = None,
     i: int | None = None,
 ) -> AnalysisCaseResult:
-    if not is_bullish_potential_setup(prev, curr):
+    if not is_bullish_potential_setup_en(prev, curr):
         return None, None, False
 
     # Third candle high ran the second candle high and happened before the low occurred.
@@ -807,7 +935,7 @@ def evaluate_bearish_engulfing_case(
     sorted_history: list[TradingViewPriceCandle] | None = None,
     i: int | None = None,
 ) -> AnalysisCaseResult:
-    if not is_bearish_potential_setup(prev, curr):
+    if not is_bearish_potential_setup_en(prev, curr):
         return None, None, False
 
     # Third candle low ran the second candle low and happened before the high occurred.
@@ -846,24 +974,6 @@ def evaluate_bearish_engulfing_case(
         j += 1
 
     return False, None, True
-
-
-def check_bullish_engulfing(
-    prev: TradingViewPriceCandle,
-    curr: TradingViewPriceCandle,
-    next_candle: TradingViewPriceCandle,
-) -> bool:
-    success, _, _ = evaluate_bullish_engulfing_case(prev, curr, next_candle)
-    return success is True
-
-
-def check_bearish_engulfing(
-    prev: TradingViewPriceCandle,
-    curr: TradingViewPriceCandle,
-    next_candle: TradingViewPriceCandle,
-) -> bool:
-    success, _, _ = evaluate_bearish_engulfing_case(prev, curr, next_candle)
-    return success is True
 
 
 def get_directions_for_bias(bias: BiasType) -> list[AnalysisDirection]:
@@ -1016,32 +1126,32 @@ async def analyze_price_data(
                     )
                     if replacement_next_candle is not None:
                         execution_next_candle = replacement_next_candle
-                # # Bullish Triple M Analysis
-                # elif payload.analysis_type == "Triple M" and direction == "Bullish":
-                #     success, replacement_next_candle, consolidation = (
-                #         evaluate_bullish_triple_m_case(
-                #             prev,
-                #             curr,
-                #             next_candle,
-                #             sorted_history,
-                #             i
-                #         )
-                #     )
-                #     if replacement_next_candle is not None:
-                #         execution_next_candle = replacement_next_candle
-                # # Bearish Triple M Analysis
-                # elif payload.analysis_type == "Triple M" and direction == "Bearish":
-                #     success, replacement_next_candle, consolidation = (
-                #         evaluate_bearish_triple_m_case(
-                #             prev,
-                #             curr,
-                #             next_candle,
-                #             sorted_history,
-                #             i
-                #         )
-                #     )
-                #     if replacement_next_candle is not None:
-                #         execution_next_candle = replacement_next_candle
+                # Bullish Triple M Analysis
+                elif payload.analysis_type == "Triple M" and direction == "Bullish":
+                    success, replacement_next_candle, consolidation = (
+                        evaluate_bullish_triple_m_case(
+                            prev,
+                            curr,
+                            next_candle,
+                            sorted_history,
+                            i
+                        )
+                    )
+                    if replacement_next_candle is not None:
+                        execution_next_candle = replacement_next_candle
+                # Bearish Triple M Analysis
+                elif payload.analysis_type == "Triple M" and direction == "Bearish":
+                    success, replacement_next_candle, consolidation = (
+                        evaluate_bearish_triple_m_case(
+                            prev,
+                            curr,
+                            next_candle,
+                            sorted_history,
+                            i
+                        )
+                    )
+                    if replacement_next_candle is not None:
+                        execution_next_candle = replacement_next_candle
                 else:
                     success = None
 
