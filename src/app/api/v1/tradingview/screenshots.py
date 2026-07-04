@@ -1,7 +1,5 @@
 import io
 from urllib.parse import urlparse
-
-import cloudinary
 import cloudinary.uploader
 import matplotlib
 
