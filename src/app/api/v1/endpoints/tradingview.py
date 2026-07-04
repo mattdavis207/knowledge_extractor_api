@@ -48,14 +48,17 @@ from app.api.v1.tradingview.utils import (
     add_high_low_order_to_parent_candles,
     build_tradingview_symbol,
     calculate_candles_range,
-    calculate_hourly_range_from_timestamps,
+    calculate_lower_timeframe_range_from_timestamps,
+    candle_label_date,
     end_date_to_target_timestamp,
     extract_metadata_list,
+    filter_candles_to_date_range,
     filter_candles_to_timestamp_range,
     find_high_before_low,  # noqa: F401
     get_candle_time,
     get_context_date_range,
     get_price_data_for_analysis_asset,
+    lower_timeframe_for_high_before,
     normalize_price_data_timeframe,
     normalize_tradingview_symbol,
     parse_body_price_assets,
@@ -64,6 +67,7 @@ from app.api.v1.tradingview.utils import (
     price_data_to_histories,
     price_data_to_keyed_items,
     start_date_to_target_timestamp,
+    timeframe_to_seconds,
     unix_seconds_to_date,
     unix_seconds_to_utc_datetime,  # noqa: F401
 )
@@ -510,7 +514,7 @@ async def get_price_data_for_assets(
     parsed_start_date: str,
     parsed_end_date: str,
     analysis_type: AnalysisType | None,
-    include_hourly_candles: bool,
+    pull_high_before: bool,
     request_delay_seconds: float | None,
 ) -> dict[str, TradingViewPriceData]:
     headers = get_tradingview_headers()
@@ -531,6 +535,7 @@ async def get_price_data_for_assets(
             parsed_start_date,
             parsed_end_date,
             analysis_type,
+            timeframe,
         )
         context_candle_range = calculate_candles_range(
             context_start_date,
@@ -569,62 +574,67 @@ async def get_price_data_for_assets(
             )
             upstream_request_count += 1
             context_history = history
-            history = filter_candles_to_timestamp_range(
+            history = filter_candles_to_date_range(
                 context_history,
-                start_timestamp,
-                target_timestamp,
+                parsed_start_date,
+                parsed_end_date,
+                timeframe,
             )
 
-            hourly_candles = []
-            hourly_to = None
-            hourly_range = None
+            high_before_candles = []
+            high_before_to = None
+            high_before_range = None
+            high_before_timeframe = None
 
-            # get hourly candles if included
-            if include_hourly_candles:
-                hourly_to = context_target_timestamp
+            # Pull lower timeframe candles when high/low sequencing is needed.
+            if pull_high_before:
+                high_before_timeframe = lower_timeframe_for_high_before(timeframe)
+                high_before_to = context_target_timestamp
                 parent_candle_times = [
                     candle_time
                     for candle in context_history
                     if (candle_time := get_candle_time(candle)) is not None
                 ]
-                hourly_start_timestamp = (
+                lower_timeframe_start_timestamp = (
                     min(parent_candle_times) if parent_candle_times else context_start_timestamp
                 )
-                hourly_range = calculate_hourly_range_from_timestamps(
-                    hourly_start_timestamp,
+                high_before_range = calculate_lower_timeframe_range_from_timestamps(
+                    lower_timeframe_start_timestamp,
                     context_target_timestamp,
+                    high_before_timeframe,
                 )
                 if upstream_request_count > 0 and delay_seconds > 0:
                     await asyncio.sleep(delay_seconds)
 
-                hourly_history = await fetch_tradingview_price_history_or_raise(
+                lower_timeframe_history = await fetch_tradingview_price_history_or_raise(
                     max_retries=settings.tradingview_price_request_max_retries,
                     retry_delay_seconds=settings.tradingview_price_request_retry_delay_seconds,
                     client=client,
                     base_url=base_url,
                     headers=headers,
                     asset=asset.symbol,
-                    timeframe="60",
+                    timeframe=high_before_timeframe,
                     candle_type=candle_type,
-                    candle_range=hourly_range,
+                    candle_range=high_before_range,
                     target_timestamp=context_target_timestamp,
                 )
                 upstream_request_count += 1
-                hourly_candles = filter_candles_to_timestamp_range(
-                    hourly_history,
-                    hourly_start_timestamp,
+                high_before_candles = filter_candles_to_timestamp_range(
+                    lower_timeframe_history,
+                    lower_timeframe_start_timestamp,
                     context_target_timestamp,
                 )
                 context_history = add_high_low_order_to_parent_candles(
                     parent_candles=context_history,
-                    hourly_candles=hourly_candles,
+                    hourly_candles=high_before_candles,
                     timeframe=timeframe,
                     target_timestamp=context_target_timestamp,
                 )
-                history = filter_candles_to_timestamp_range(
+                history = filter_candles_to_date_range(
                     context_history,
-                    start_timestamp,
-                    target_timestamp,
+                    parsed_start_date,
+                    parsed_end_date,
+                    timeframe,
                 )
 
             output[asset.response_key] = TradingViewPriceData(
@@ -641,10 +651,16 @@ async def get_price_data_for_assets(
                 count=len(history),
                 history=history,
                 context_history=context_history,
-                hourly_range=hourly_range,
-                hourly_to=hourly_to,
-                hourly_count=len(hourly_candles),
-                hourly_candles=hourly_candles,
+                pull_high_before=pull_high_before,
+                high_before_timeframe=high_before_timeframe,
+                high_before_range=high_before_range,
+                high_before_to=high_before_to,
+                high_before_count=len(high_before_candles),
+                high_before_candles=high_before_candles,
+                hourly_range=high_before_range,
+                hourly_to=high_before_to,
+                hourly_count=len(high_before_candles),
+                hourly_candles=high_before_candles,
             )
 
     return output
@@ -674,15 +690,24 @@ async def get_price_data(
     start_date: str | None = None,
     end_date: str | None = None,
     analysis_type: AnalysisType | None = None,
-    include_hourly_candles: Annotated[
+    pull_high_before: Annotated[
         bool,
         Query(
             description=(
-                "Also fetch 1-hour candles for the same date range so analysis can infer "
-                "whether the weekly high or low formed first."
+                "Also fetch the configured lower timeframe candles so analysis can infer "
+                "whether the parent candle high or low formed first."
             )
         ),
     ] = False,
+    include_hourly_candles: Annotated[
+        bool | None,
+        Query(
+            description=(
+                "Deprecated alias for pull_high_before. Weekly uses 1-hour candles; "
+                "daily uses 15-minute candles."
+            )
+        ),
+    ] = None,
     request_delay_seconds: Annotated[
         float | None,
         Query(
@@ -732,7 +757,7 @@ async def get_price_data(
         parsed_start_date=parsed_start_date,
         parsed_end_date=parsed_end_date,
         analysis_type=analysis_type,
-        include_hourly_candles=include_hourly_candles,
+        pull_high_before=pull_high_before or bool(include_hourly_candles),
         request_delay_seconds=request_delay_seconds,
     )
 
@@ -773,7 +798,7 @@ async def post_price_data(
         parsed_start_date=parsed_start_date,
         parsed_end_date=parsed_end_date,
         analysis_type=payload.analysis_type,
-        include_hourly_candles=payload.include_hourly_candles,
+        pull_high_before=payload.pull_high_before or bool(payload.include_hourly_candles),
         request_delay_seconds=payload.request_delay_seconds,
     )
 
@@ -1166,10 +1191,11 @@ def resolve_analysis_asset(
     pair_key: str,
     assets: dict[str, TradingViewAssetRequest],
     price_data: PriceDataInput,
-) -> tuple[str, str | None, str | None, BiasType]:
+) -> tuple[str, str | None, str | None, str | None, BiasType]:
     exchange_from_key, pair = parse_symbol_parts(pair_key)
     asset_config = assets.get(pair_key) or assets.get(pair)
     asset_price_data = get_price_data_for_analysis_asset(pair_key, pair, price_data)
+    timeframe = asset_price_data.timeframe if asset_price_data else None
 
     if asset_config:
         exchange = asset_config.exchange.strip().upper()
@@ -1183,7 +1209,33 @@ def resolve_analysis_asset(
 
     symbol = build_tradingview_symbol(exchange, pair) if exchange else pair
 
-    return pair, exchange, symbol, bias
+    return pair, exchange, symbol, timeframe, bias
+
+
+def infer_candle_interval_seconds(candles: list[TradingViewPriceCandle]) -> int | None:
+    candle_times = sorted({candle.time for candle in candles})
+    intervals = [
+        current_time - previous_time
+        for previous_time, current_time in zip(candle_times, candle_times[1:], strict=False)
+        if current_time > previous_time
+    ]
+    return min(intervals) if intervals else None
+
+
+def screenshot_padding_unit_seconds(
+    timeframe: str | None,
+    context_history: list[TradingViewPriceCandle],
+) -> int:
+    if timeframe:
+        timeframe_seconds = timeframe_to_seconds(timeframe)
+        if timeframe_seconds is not None:
+            return timeframe_seconds
+
+    inferred_seconds = infer_candle_interval_seconds(context_history)
+    if inferred_seconds is not None:
+        return inferred_seconds
+
+    return 7 * 24 * 60 * 60
 
 
 def generate_screenshot_url(
@@ -1206,11 +1258,15 @@ def generate_screenshot_url(
 
     analysis_type = asset.analysis_type
     context_history = sorted(asset.context_history, key=lambda candle: candle.time)
+    padding_unit_seconds = screenshot_padding_unit_seconds(
+        execution.timeframe or asset.timeframe,
+        context_history,
+    )
 
     # calculate padded start_date and end_date
-    start_window_weeks, end_window_weeks = SCREENSHOT_PADDING_WINDOW_WEEKS[analysis_type]
-    padded_start_date = setup_start_unix_seconds - (604800 * start_window_weeks)
-    padded_end_date = setup_end_unix_seconds + (604800 * end_window_weeks)
+    start_window, end_window = SCREENSHOT_PADDING_WINDOW_WEEKS[analysis_type]
+    padded_start_date = setup_start_unix_seconds - (padding_unit_seconds * start_window)
+    padded_end_date = setup_end_unix_seconds + (padding_unit_seconds * end_window)
     
     start_index = next(
         (i for i, history_item in enumerate(context_history)
@@ -1268,7 +1324,7 @@ async def analyze_price_data(
     asset_results: dict[str, TradingViewAssetAnalyzeResult] = {}
 
     for pair_key, history in histories.items():
-        pair, exchange, symbol, bias = resolve_analysis_asset(
+        pair, exchange, symbol, timeframe, bias = resolve_analysis_asset(
             pair_key,
             payload.assets,
             payload.price_data,
@@ -1366,6 +1422,7 @@ async def analyze_price_data(
                         pair=pair,
                         exchange=exchange,
                         symbol=symbol,
+                        timeframe=timeframe,
                         bias=bias,
                         analysis_type=payload.analysis_type,
                         direction=direction,
@@ -1375,9 +1432,9 @@ async def analyze_price_data(
                         prev=prev,
                         curr=execution_curr_candle,
                         next_candle=execution_next_candle,
-                        prev_date=unix_seconds_to_date(prev.time),
-                        curr_date=unix_seconds_to_date(execution_curr_candle.time),
-                        next_date=unix_seconds_to_date(execution_next_candle.time),
+                        prev_date=candle_label_date(prev.time, timeframe),
+                        curr_date=candle_label_date(execution_curr_candle.time, timeframe),
+                        next_date=candle_label_date(execution_next_candle.time, timeframe),
                     )
                 )
 
@@ -1406,6 +1463,7 @@ async def analyze_price_data(
             pair=pair,
             exchange=exchange,
             symbol=symbol,
+            timeframe=timeframe,
             bias=bias,
             analysis_type=payload.analysis_type,
             bullish_success_count=bullish_success_count,

@@ -40,6 +40,7 @@ def get_context_date_range(
     start_date: str | date | datetime,
     end_date: str | date | datetime,
     analysis_type: AnalysisType | None,
+    timeframe: str = "W",
 ) -> tuple[date, date]:
     parsed_start_date = parse_analysis_date(start_date)
     parsed_end_date = parse_analysis_date(end_date)
@@ -47,10 +48,16 @@ def get_context_date_range(
     if analysis_type is None:
         return parsed_start_date, parsed_end_date
 
-    start_window_weeks, end_window_weeks = ANALYSIS_CONTEXT_WINDOWS_WEEKS[analysis_type]
+    start_window, end_window = ANALYSIS_CONTEXT_WINDOWS_WEEKS[analysis_type]
+    if timeframe == "D":
+        return (
+            parsed_start_date - timedelta(days=start_window),
+            parsed_end_date + timedelta(days=end_window),
+        )
+
     return (
-        parsed_start_date - timedelta(weeks=start_window_weeks),
-        parsed_end_date + timedelta(weeks=end_window_weeks),
+        parsed_start_date - timedelta(weeks=start_window),
+        parsed_end_date + timedelta(weeks=end_window),
     )
 
 
@@ -60,6 +67,14 @@ def unix_seconds_to_utc_datetime(timestamp: int | float) -> datetime:
 
 def unix_seconds_to_date(timestamp: int | float) -> date:
     return unix_seconds_to_utc_datetime(timestamp).date()
+
+
+def candle_label_date(timestamp: int | float, timeframe: str | None = None) -> date:
+    candle_datetime = unix_seconds_to_utc_datetime(timestamp)
+    if timeframe in {"D", "W", "M"}:
+        candle_datetime = candle_datetime + timedelta(hours=12)
+
+    return candle_datetime.date()
 
 
 def parse_symbol_parts(symbol: str) -> tuple[str | None, str]:
@@ -325,6 +340,31 @@ def filter_candles_to_timestamp_range(
     return filtered_history
 
 
+def filter_candles_to_date_range(
+    history: list[dict],
+    start_date: str | date | datetime,
+    end_date: str | date | datetime,
+    timeframe: str,
+) -> list[dict]:
+    parsed_start_date = parse_analysis_date(start_date)
+    parsed_end_date = parse_analysis_date(end_date)
+    filtered_history = []
+
+    for candle in history:
+        if not isinstance(candle, dict):
+            continue
+
+        candle_time = candle.get("time")
+        if not isinstance(candle_time, int):
+            continue
+
+        label_date = candle_label_date(candle_time, timeframe)
+        if parsed_start_date <= label_date <= parsed_end_date:
+            filtered_history.append(candle)
+
+    return filtered_history
+
+
 def prices_match(
     first_price: float | int | None,
     second_price: float | int | None,
@@ -340,15 +380,51 @@ def prices_match(
     )
 
 
-def calculate_hourly_range_from_timestamps(
+def calculate_lower_timeframe_range_from_timestamps(
     start_timestamp: int,
     end_timestamp: int,
+    lower_timeframe: str,
 ) -> int:
     if end_timestamp < start_timestamp:
         raise ValueError("end_timestamp must be on or after start_timestamp")
 
+    lower_timeframe_seconds = timeframe_to_seconds(lower_timeframe)
+    if lower_timeframe_seconds is None:
+        raise ValueError(f"Unsupported lower timeframe: {lower_timeframe}")
+
     seconds_in_range = end_timestamp - start_timestamp + 1
-    return math.ceil(seconds_in_range / PRICE_TIMEFRAME_SECONDS["60"])
+    return math.ceil(seconds_in_range / lower_timeframe_seconds)
+
+
+def calculate_hourly_range_from_timestamps(
+    start_timestamp: int,
+    end_timestamp: int,
+) -> int:
+    return calculate_lower_timeframe_range_from_timestamps(start_timestamp, end_timestamp, "60")
+
+
+def lower_timeframe_for_high_before(parent_timeframe: str) -> str:
+    if parent_timeframe == "D":
+        return "15"
+
+    return "60"
+
+
+def lower_timeframe_label(lower_timeframe: str) -> str:
+    if lower_timeframe in PRICE_TIMEFRAME_SECONDS:
+        seconds = PRICE_TIMEFRAME_SECONDS[lower_timeframe]
+        if seconds % 3600 == 0:
+            hours = seconds // 3600
+            return f"{hours}h"
+        if seconds % 60 == 0:
+            minutes = seconds // 60
+            return f"{minutes}m"
+
+    return lower_timeframe
+
+
+def lower_timeframe_output_field_prefix(lower_timeframe: str) -> str:
+    return lower_timeframe_label(lower_timeframe).replace(" ", "_")
 
 
 def get_price_value(candle: dict, keys: tuple[str, ...]) -> float | int | None:

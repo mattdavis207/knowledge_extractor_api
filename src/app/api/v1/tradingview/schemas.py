@@ -75,7 +75,8 @@ class TradingViewPriceDataRequest(BaseModel):
     ed: str | None = None
     analysis_type: AnalysisType | None = None
     candle_type: PriceCandleType = Field(default="Japanese", alias="type")
-    include_hourly_candles: bool = False
+    pull_high_before: bool = False
+    include_hourly_candles: bool | None = None
     request_delay_seconds: float | None = Field(default=None, ge=0)
 
 
@@ -101,6 +102,12 @@ class TradingViewPriceData(BaseModel):
     count: int
     history: list[TradingViewPriceCandle]
     context_history: list[TradingViewPriceCandle] = Field(default_factory=list)
+    pull_high_before: bool = False
+    high_before_timeframe: str | None = None
+    high_before_range: int | None = None
+    high_before_to: int | None = None
+    high_before_count: int = 0
+    high_before_candles: list[TradingViewPriceCandle] = Field(default_factory=list)
     hourly_range: int | None = None
     hourly_to: int | None = None
     hourly_count: int = 0
@@ -122,6 +129,7 @@ class TradingViewAnalysisExecution(BaseModel):
     pair: str
     exchange: str | None = None
     symbol: str | None = None
+    timeframe: str | None = None
     bias: BiasType
     analysis_type: AnalysisType
     direction: AnalysisDirection
@@ -150,6 +158,7 @@ class TradingViewAssetAnalyzeResult(BaseModel):
     pair: str
     exchange: str | None = None
     symbol: str | None = None
+    timeframe: str | None = None
     bias: BiasType
     analysis_type: AnalysisType
     bullish_success_count: int = 0
