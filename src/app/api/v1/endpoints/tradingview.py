@@ -301,6 +301,17 @@ def raise_tradingview_http_error(exc: httpx.HTTPStatusError) -> None:
     ) from exc
 
 
+def retry_after_seconds(response: httpx.Response) -> float | None:
+    retry_after = response.headers.get("retry-after")
+    if not retry_after:
+        return None
+
+    try:
+        return max(0.0, float(retry_after))
+    except ValueError:
+        return None
+
+
 async def fetch_tradingview_price_history(
     *,
     client: httpx.AsyncClient,
@@ -337,6 +348,36 @@ async def fetch_tradingview_price_history(
         return []
 
     return history
+
+
+async def fetch_tradingview_price_history_or_raise(
+    max_retries: int,
+    retry_delay_seconds: float,
+    **kwargs,
+) -> list[dict]:
+    for attempt in range(max_retries + 1):
+        try:
+            return await fetch_tradingview_price_history(**kwargs)
+        except httpx.HTTPStatusError as exc:
+            if (
+                exc.response.status_code != status.HTTP_429_TOO_MANY_REQUESTS
+                or attempt >= max_retries
+            ):
+                raise_tradingview_http_error(exc)
+
+            wait_seconds = retry_after_seconds(exc.response) or retry_delay_seconds
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="TradingView API request failed.",
+            ) from exc
+
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail="TradingView API request failed.",
+    )
 
 
 @router.get(
@@ -514,7 +555,9 @@ async def get_price_data_for_assets(
             if upstream_request_count > 0 and delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
 
-            history = await fetch_tradingview_price_history(
+            history = await fetch_tradingview_price_history_or_raise(
+                max_retries=settings.tradingview_price_request_max_retries,
+                retry_delay_seconds=settings.tradingview_price_request_retry_delay_seconds,
                 client=client,
                 base_url=base_url,
                 headers=headers,
@@ -554,7 +597,9 @@ async def get_price_data_for_assets(
                 if upstream_request_count > 0 and delay_seconds > 0:
                     await asyncio.sleep(delay_seconds)
 
-                hourly_history = await fetch_tradingview_price_history(
+                hourly_history = await fetch_tradingview_price_history_or_raise(
+                    max_retries=settings.tradingview_price_request_max_retries,
+                    retry_delay_seconds=settings.tradingview_price_request_retry_delay_seconds,
                     client=client,
                     base_url=base_url,
                     headers=headers,
