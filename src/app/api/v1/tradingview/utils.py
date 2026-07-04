@@ -404,9 +404,7 @@ def calculate_hourly_range_from_timestamps(
 
 
 def lower_timeframe_for_high_before(parent_timeframe: str) -> str:
-    if parent_timeframe == "D":
-        return "15"
-
+    # 30m/15m forex history is spotty from this provider; hourly is the reliable fallback.
     return "60"
 
 

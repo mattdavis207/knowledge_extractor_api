@@ -78,6 +78,7 @@ class TradingViewPriceDataRequest(BaseModel):
     pull_high_before: bool = False
     include_hourly_candles: bool | None = None
     request_delay_seconds: float | None = Field(default=None, ge=0)
+    max_candles_per_request: int | None = Field(default=None, ge=1)
 
 
 class ParsedTradingViewAsset(BaseModel):

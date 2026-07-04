@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from typing import Annotated, Literal
 from urllib.parse import quote
@@ -74,6 +75,7 @@ from app.api.v1.tradingview.utils import (
 from app.core.config import settings
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 currency_pairs_cache: dict[
@@ -82,6 +84,12 @@ currency_pairs_cache: dict[
 ] = {}
 RETRYABLE_PRICE_STATUS_CODES = {
     status.HTTP_429_TOO_MANY_REQUESTS,
+    status.HTTP_500_INTERNAL_SERVER_ERROR,
+    status.HTTP_502_BAD_GATEWAY,
+    status.HTTP_503_SERVICE_UNAVAILABLE,
+    status.HTTP_504_GATEWAY_TIMEOUT,
+}
+ADAPTIVE_PRICE_CHUNK_STATUS_CODES = {
     status.HTTP_500_INTERNAL_SERVER_ERROR,
     status.HTTP_502_BAD_GATEWAY,
     status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -324,6 +332,34 @@ def retry_after_seconds(response: httpx.Response) -> float | None:
         return None
 
 
+def log_tradingview_price_response_error(
+    response: httpx.Response,
+    *,
+    asset: str,
+    timeframe: str,
+    candle_range: int,
+    target_timestamp: int,
+    attempt: int | None = None,
+) -> None:
+    try:
+        response_body = response.text
+    except httpx.ResponseNotRead:
+        response_body = "<response body not read>"
+
+    logger.warning(
+        "TradingView price API error%s: status=%s asset=%s timeframe=%s range=%s "
+        "to=%s url=%s body=%s",
+        f" attempt={attempt}" if attempt is not None else "",
+        response.status_code,
+        asset,
+        timeframe,
+        candle_range,
+        target_timestamp,
+        response.request.url,
+        response_body[:1000],
+    )
+
+
 async def fetch_tradingview_price_history(
     *,
     client: httpx.AsyncClient,
@@ -349,6 +385,16 @@ async def fetch_tradingview_price_history(
     payload = response.json()
 
     if not payload.get("success", False):
+        logger.warning(
+            "TradingView price API returned unsuccessful payload: asset=%s "
+            "timeframe=%s range=%s to=%s msg=%s payload=%s",
+            asset,
+            timeframe,
+            candle_range,
+            target_timestamp,
+            payload.get("msg"),
+            str(payload)[:1000],
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=payload.get("msg") or "TradingView API request failed.",
@@ -365,22 +411,43 @@ async def fetch_tradingview_price_history(
 async def fetch_tradingview_price_history_or_raise(
     max_retries: int,
     retry_delay_seconds: float,
+    raise_raw_status_error: bool = False,
     **kwargs,
 ) -> list[dict]:
     for attempt in range(max_retries + 1):
         try:
             return await fetch_tradingview_price_history(**kwargs)
         except httpx.HTTPStatusError as exc:
+            log_tradingview_price_response_error(
+                exc.response,
+                asset=kwargs["asset"],
+                timeframe=kwargs["timeframe"],
+                candle_range=kwargs["candle_range"],
+                target_timestamp=kwargs["target_timestamp"],
+                attempt=attempt + 1,
+            )
             if (
                 exc.response.status_code not in RETRYABLE_PRICE_STATUS_CODES
                 or attempt >= max_retries
             ):
+                if raise_raw_status_error:
+                    raise
+
                 raise_tradingview_http_error(exc)
 
             wait_seconds = retry_after_seconds(exc.response) or retry_delay_seconds
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
         except httpx.HTTPError as exc:
+            logger.warning(
+                "TradingView price API request failed before receiving a valid response: "
+                "asset=%s timeframe=%s range=%s to=%s error=%s",
+                kwargs["asset"],
+                kwargs["timeframe"],
+                kwargs["candle_range"],
+                kwargs["target_timestamp"],
+                repr(exc),
+            )
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="TradingView API request failed.",
@@ -401,14 +468,6 @@ async def fetch_tradingview_price_history_window_or_raise(
     timeframe: str,
     **kwargs,
 ) -> list[dict]:
-    if candle_range <= max_candles_per_request:
-        return await fetch_tradingview_price_history_or_raise(
-            candle_range=candle_range,
-            target_timestamp=target_timestamp,
-            timeframe=timeframe,
-            **kwargs,
-        )
-
     timeframe_seconds = timeframe_to_seconds(timeframe)
     if timeframe_seconds is None:
         raise HTTPException(
@@ -419,15 +478,43 @@ async def fetch_tradingview_price_history_window_or_raise(
     history_by_time: dict[int, dict] = {}
     remaining_range = candle_range
     current_target_timestamp = target_timestamp
+    adaptive_chunk_limit = max_candles_per_request
+    min_adaptive_chunk_range = min(100, max_candles_per_request)
 
     while remaining_range > 0:
-        chunk_range = min(remaining_range, max_candles_per_request)
-        chunk_history = await fetch_tradingview_price_history_or_raise(
-            candle_range=chunk_range,
-            target_timestamp=current_target_timestamp,
-            timeframe=timeframe,
-            **kwargs,
-        )
+        chunk_range = min(remaining_range, adaptive_chunk_limit)
+        try:
+            chunk_history = await fetch_tradingview_price_history_or_raise(
+                candle_range=chunk_range,
+                target_timestamp=current_target_timestamp,
+                timeframe=timeframe,
+                raise_raw_status_error=True,
+                **kwargs,
+            )
+        except httpx.HTTPStatusError as exc:
+            if (
+                exc.response.status_code in ADAPTIVE_PRICE_CHUNK_STATUS_CODES
+                and chunk_range > min_adaptive_chunk_range
+            ):
+                adaptive_chunk_limit = max(
+                    min_adaptive_chunk_range,
+                    chunk_range // 2,
+                )
+                logger.warning(
+                    "Reducing TradingView price chunk size after upstream status=%s: "
+                    "asset=%s timeframe=%s previous_range=%s next_range=%s to=%s",
+                    exc.response.status_code,
+                    kwargs["asset"],
+                    timeframe,
+                    chunk_range,
+                    adaptive_chunk_limit,
+                    current_target_timestamp,
+                )
+                if request_delay_seconds > 0:
+                    await asyncio.sleep(request_delay_seconds)
+                continue
+
+            raise_tradingview_http_error(exc)
 
         chunk_times = []
         for candle in chunk_history:
@@ -585,6 +672,7 @@ async def get_price_data_for_assets(
     analysis_type: AnalysisType | None,
     pull_high_before: bool,
     request_delay_seconds: float | None,
+    max_candles_per_request: int | None,
 ) -> dict[str, TradingViewPriceData]:
     headers = get_tradingview_headers()
     base_url = str(settings.tradingview_api_base_url).rstrip("/")
@@ -592,6 +680,11 @@ async def get_price_data_for_assets(
         settings.tradingview_price_request_delay_seconds
         if request_delay_seconds is None
         else request_delay_seconds
+    )
+    candles_per_request = (
+        settings.tradingview_price_request_max_candles_per_request
+        if max_candles_per_request is None
+        else max_candles_per_request
     )
 
     try:
@@ -632,9 +725,7 @@ async def get_price_data_for_assets(
             history = await fetch_tradingview_price_history_window_or_raise(
                 max_retries=settings.tradingview_price_request_max_retries,
                 retry_delay_seconds=settings.tradingview_price_request_retry_delay_seconds,
-                max_candles_per_request=(
-                    settings.tradingview_price_request_max_candles_per_request
-                ),
+                max_candles_per_request=candles_per_request,
                 request_delay_seconds=delay_seconds,
                 client=client,
                 base_url=base_url,
@@ -682,9 +773,7 @@ async def get_price_data_for_assets(
                 lower_timeframe_history = await fetch_tradingview_price_history_window_or_raise(
                     max_retries=settings.tradingview_price_request_max_retries,
                     retry_delay_seconds=settings.tradingview_price_request_retry_delay_seconds,
-                    max_candles_per_request=(
-                        settings.tradingview_price_request_max_candles_per_request
-                    ),
+                    max_candles_per_request=candles_per_request,
                     request_delay_seconds=delay_seconds,
                     client=client,
                     base_url=base_url,
@@ -780,8 +869,7 @@ async def get_price_data(
         bool | None,
         Query(
             description=(
-                "Deprecated alias for pull_high_before. Weekly uses 1-hour candles; "
-                "daily uses 15-minute candles."
+                "Deprecated alias for pull_high_before. Weekly and daily use 1-hour candles."
             )
         ),
     ] = None,
@@ -792,6 +880,16 @@ async def get_price_data(
             description=(
                 "Optional delay between upstream TradingView price requests. "
                 "Defaults to TRADINGVIEW_PRICE_REQUEST_DELAY_SECONDS."
+            ),
+        ),
+    ] = None,
+    max_candles_per_request: Annotated[
+        int | None,
+        Query(
+            ge=1,
+            description=(
+                "Optional maximum candles per upstream TradingView price request. "
+                "Lower values reduce upstream timeout risk for large lower-timeframe windows."
             ),
         ),
     ] = None,
@@ -836,6 +934,7 @@ async def get_price_data(
         analysis_type=analysis_type,
         pull_high_before=pull_high_before or bool(include_hourly_candles),
         request_delay_seconds=request_delay_seconds,
+        max_candles_per_request=max_candles_per_request,
     )
 
 
@@ -877,9 +976,94 @@ async def post_price_data(
         analysis_type=payload.analysis_type,
         pull_high_before=payload.pull_high_before or bool(payload.include_hourly_candles),
         request_delay_seconds=payload.request_delay_seconds,
+        max_candles_per_request=payload.max_candles_per_request,
     )
 
     return TradingViewPriceDataResponse(price_data=price_data_to_keyed_items(price_data))
+
+
+@router.get(
+    "/price-data/test-intraday",
+    summary="Debug TradingView intraday candle availability for one upstream request.",
+)
+async def test_intraday_price_data(
+    asset: Annotated[
+        str,
+        Query(description="TradingView symbol, including exchange, for example FX:AUDUSD."),
+    ] = "FX:AUDUSD",
+    timeframe: Annotated[
+        str,
+        Query(description="TradingView intraday timeframe, for example 15, 30, or 60."),
+    ] = "30",
+    candle_range: Annotated[
+        int,
+        Query(
+            alias="range",
+            ge=1,
+            le=5000,
+            description="Number of candles to request directly from TradingView.",
+        ),
+    ] = 10,
+    candle_type: Annotated[
+        PriceCandleType,
+        Query(alias="type", description="TradingView candle type."),
+    ] = "Japanese",
+    to: Annotated[
+        int | None,
+        Query(description="Optional TradingView target Unix timestamp in seconds."),
+    ] = None,
+) -> dict[str, object]:
+    headers = get_tradingview_headers()
+    base_url = str(settings.tradingview_api_base_url).rstrip("/")
+    params: dict[str, object] = {
+        "timeframe": timeframe,
+        "type": candle_type,
+        "range": candle_range,
+    }
+    if to is not None:
+        params["to"] = to
+
+    started_at = time.monotonic()
+    async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
+        try:
+            upstream_response = await client.get(
+                f"{base_url}{PRICE_ENDPOINT}/{quote(asset, safe='')}",
+                headers=headers,
+                params=params,
+            )
+        except httpx.HTTPError as exc:
+            return {
+                "upstream_ok": False,
+                "request_error": repr(exc),
+                "asset": asset,
+                "params": params,
+                "elapsed_seconds": round(time.monotonic() - started_at, 3),
+            }
+
+    elapsed_seconds = round(time.monotonic() - started_at, 3)
+    try:
+        payload = upstream_response.json()
+    except ValueError:
+        payload = None
+
+    history = None
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            history = data.get("history")
+
+    return {
+        "upstream_ok": upstream_response.is_success,
+        "upstream_status_code": upstream_response.status_code,
+        "asset": asset,
+        "params": params,
+        "url": str(upstream_response.request.url),
+        "elapsed_seconds": elapsed_seconds,
+        "payload_success": payload.get("success") if isinstance(payload, dict) else None,
+        "history_count": len(history) if isinstance(history, list) else None,
+        "payload": payload,
+        "body": None if payload is not None else upstream_response.text[:4000],
+    }
 
 
 def is_bullish_potential_setup_tm(
