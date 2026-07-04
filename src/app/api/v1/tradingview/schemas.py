@@ -127,6 +127,7 @@ class TradingViewAnalysisExecution(BaseModel):
     direction: AnalysisDirection
     success: bool
     consolidation: bool
+    inside_bar: bool = False
     prev: TradingViewPriceCandle
     curr: TradingViewPriceCandle
     next_candle: TradingViewPriceCandle

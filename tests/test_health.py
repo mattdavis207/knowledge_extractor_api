@@ -64,14 +64,33 @@ def test_local_exchanges_json_route() -> None:
 
 
 def test_analysis_webhook_proxy_posts_payload(monkeypatch) -> None:
-    async def stub_post_analysis_webhook(payload: dict) -> int:
+    async def stub_post_analysis_webhook(payload: dict, webhook_environment: str) -> int:
         assert payload == {"assets": ["FX:EURUSD"]}
+        assert webhook_environment == "prod"
         return 200
 
     monkeypatch.setattr(app.main, "post_analysis_webhook", stub_post_analysis_webhook)
 
     client = TestClient(create_app())
     response = client.post("/analysis-webhook", json={"assets": ["FX:EURUSD"]})
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "sent", "webhook_status_code": 200}
+
+
+def test_analysis_webhook_proxy_supports_test_webhook_flag(monkeypatch) -> None:
+    async def stub_post_analysis_webhook(payload: dict, webhook_environment: str) -> int:
+        assert payload == {"assets": ["FX:EURUSD"]}
+        assert webhook_environment == "test"
+        return 200
+
+    monkeypatch.setattr(app.main, "post_analysis_webhook", stub_post_analysis_webhook)
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/analysis-webhook?webhook_environment=test",
+        json={"assets": ["FX:EURUSD"]},
+    )
 
     assert response.status_code == 200
     assert response.json() == {"status": "sent", "webhook_status_code": 200}

@@ -417,6 +417,14 @@
           </select>
         </label>
 
+        <label>
+          <span class="field-label">Webhook Target</span>
+          <select id="webhookEnvironment" name="webhookEnvironment" required>
+            <option value="prod">Production</option>
+            <option value="test">Test</option>
+          </select>
+        </label>
+
         <div class="actions">
           <button class="primary" type="submit">Submit</button>
           <button type="reset">Reset</button>
@@ -480,6 +488,11 @@
       })[char]);
     }
 
+    function escapeCssIdentifier(value) {
+      if (window.CSS?.escape) return CSS.escape(value);
+      return String(value || "").replace(/["\\]/g, "\\$&");
+    }
+
     function tickerFromSymbol(symbol) {
       return String(symbol || "").split(":").pop().replace(/[^A-Z]/gi, "").toUpperCase();
     }
@@ -538,6 +551,50 @@
       qs("defaultExchange").disabled = !state.exchanges.length;
     }
 
+    function updateAssetStatus() {
+      qs("assetStatus").textContent = `${state.selected.size} selected / ${state.assets.length} loaded`;
+    }
+
+    function assetListScrollPositions() {
+      return Object.fromEntries(
+        Array.from(document.querySelectorAll("#assetGroups .asset-group")).map((group) => [
+          group.dataset.groupKey,
+          group.querySelector(".asset-list")?.scrollTop || 0
+        ])
+      );
+    }
+
+    function restoreAssetListScrollPositions(positions) {
+      Object.entries(positions).forEach(([groupKey, scrollTop]) => {
+        const list = document.querySelector(
+          `#assetGroups .asset-group[data-group-key="${escapeCssIdentifier(groupKey)}"] .asset-list`
+        );
+        if (list) list.scrollTop = scrollTop;
+      });
+    }
+
+    function setRenderedAssetSelected(key, selected) {
+      const option = document.querySelector(
+        `#assetGroups .asset-option[data-asset-key="${escapeCssIdentifier(key)}"]`
+      );
+      if (!option) return;
+
+      option.classList.toggle("selected", selected);
+      const checkbox = option.querySelector('input[type="checkbox"]');
+      if (checkbox) checkbox.checked = selected;
+      option.querySelectorAll("select[data-config-field]").forEach((select) => {
+        select.disabled = !selected;
+      });
+    }
+
+    function setRenderedSelectedConfig(field, value) {
+      document.querySelectorAll(`#assetGroups select[data-config-field="${field}"]`).forEach((select) => {
+        if (state.selected.has(select.dataset.assetKey)) {
+          select.value = value;
+        }
+      });
+    }
+
     function renderTimeframes() {
       qs("timeframes").innerHTML = timeframes.map(([value, label], index) => `
         <label class="choice">
@@ -547,7 +604,8 @@
       `).join("");
     }
 
-    function renderAssets() {
+    function renderAssets({ preserveScroll = false } = {}) {
+      const scrollPositions = preserveScroll ? assetListScrollPositions() : {};
       const term = qs("assetSearch").value.trim().toLowerCase();
       state.visible = state.assets.filter((asset) => {
         const text = `${asset.symbol} ${labelForAsset(asset)}`.toLowerCase();
@@ -558,7 +616,7 @@
       state.visible.forEach((asset) => grouped[classifyAsset(asset)].push(asset));
 
       qs("assetGroups").innerHTML = groups.map(([key, title]) => `
-        <section class="asset-group">
+        <section class="asset-group" data-group-key="${escapeHtml(key)}">
           <h3>${title}<span class="group-count">${grouped[key].length}</span></h3>
           <div class="asset-list">
             ${grouped[key].map((asset) => {
@@ -566,7 +624,7 @@
               const selected = state.selected.has(key);
               const config = getAssetConfig(key);
               return `
-                <div class="asset-option ${selected ? "selected" : ""}">
+                <div class="asset-option ${selected ? "selected" : ""}" data-asset-key="${escapeHtml(key)}">
                   <label class="asset-pick">
                     <input type="checkbox" value="${escapeHtml(key)}" ${selected ? "checked" : ""}>
                     <span>
@@ -595,7 +653,8 @@
         </section>
       `).join("");
 
-      qs("assetStatus").textContent = `${state.selected.size} selected / ${state.assets.length} loaded`;
+      if (preserveScroll) restoreAssetListScrollPositions(scrollPositions);
+      updateAssetStatus();
     }
 
     async function loadAssets() {
@@ -656,7 +715,8 @@
         } else {
           state.selected.delete(key);
         }
-        renderAssets();
+        setRenderedAssetSelected(key, event.target.checked);
+        updateAssetStatus();
         return;
       }
 
@@ -665,7 +725,6 @@
       if (!configField || !key) return;
 
       getAssetConfig(key)[configField] = event.target.value;
-      renderAssets();
     });
 
     qs("assetSearch").addEventListener("input", renderAssets);
@@ -676,12 +735,12 @@
         state.selected.add(key);
         getAssetConfig(key);
       });
-      renderAssets();
+      renderAssets({ preserveScroll: true });
     });
 
     qs("clearVisible").addEventListener("click", () => {
       state.visible.forEach((asset) => state.selected.delete(assetKey(asset)));
-      renderAssets();
+      renderAssets({ preserveScroll: true });
     });
 
     qs("defaultExchange").addEventListener("change", () => {
@@ -689,7 +748,7 @@
       state.selected.forEach((key) => {
         getAssetConfig(key).exchange = state.defaultExchange;
       });
-      renderAssets();
+      setRenderedSelectedConfig("exchange", state.defaultExchange);
     });
 
     qs("defaultBias").addEventListener("change", () => {
@@ -697,7 +756,7 @@
       state.selected.forEach((key) => {
         getAssetConfig(key).bias = state.defaultBias;
       });
-      renderAssets();
+      setRenderedSelectedConfig("bias", state.defaultBias);
     });
 
     qs("analysisForm").addEventListener("submit", async (event) => {
@@ -735,7 +794,9 @@
       }, null, 2);
 
       try {
-        const webhookResponse = await fetch(WEBHOOK_PROXY_ENDPOINT, {
+        const webhookUrl = new URL(WEBHOOK_PROXY_ENDPOINT);
+        webhookUrl.searchParams.set("webhook_environment", qs("webhookEnvironment").value);
+        const webhookResponse = await fetch(webhookUrl.toString(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(submitted)

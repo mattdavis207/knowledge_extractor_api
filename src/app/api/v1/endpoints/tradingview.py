@@ -738,17 +738,100 @@ async def post_price_data(
 def is_bullish_potential_setup_tm(
     prev: TradingViewPriceCandle,
     curr: TradingViewPriceCandle,
-) -> bool:
-    # candle 2 runs candle 1's low and closes within candle 1's range (non-inclusive lower bound)
-    return curr.min < prev.min and (prev.min < curr.close <= prev.max)
+    sorted_history: list[TradingViewPriceCandle] | None = None,
+    i: int | None = None,
+) -> tuple[
+    bool,
+    TradingViewPriceCandle | None,
+    TradingViewPriceCandle | None,
+    bool,
+]:
+    # Candle 2 runs candle 1's low, closes back inside range, and does not run the high.
+    is_potential_setup = (
+        (curr.min < prev.min) and (prev.min < curr.close <= prev.max) and (curr.max <= prev.max)
+    )
+
+    if is_potential_setup:
+        return True, None, None, False
+
+    if sorted_history is None:
+        return False, None, None, False
+
+    start_index = i
+    if start_index is None:
+        start_index = next(
+            (index for index, candle in enumerate(sorted_history) if candle.time == curr.time),
+            None,
+        )
+
+    if start_index is None:
+        return False, None, None, False
+
+    for j in range(start_index, len(sorted_history) - 1):
+        candidate = sorted_history[j]
+        candidate_is_potential_setup = (
+            (candidate.min < prev.min)
+            and (prev.min < candidate.close <= prev.max)
+            and (candidate.max <= prev.max)
+        )
+
+        if candidate_is_potential_setup:
+            return True, candidate, sorted_history[j + 1], True
+
+        if candidate.max > prev.max or candidate.min < prev.min:
+            return False, None, None, True
+
+    return False, None, None, True
 
 
 def is_bearish_potential_setup_tm(
     prev: TradingViewPriceCandle,
     curr: TradingViewPriceCandle,
-) -> bool:
-    # candle 2 runs candle 1's high and closes within candle 1's range (non-inclusive upper bound)
-    return curr.max > prev.max and (prev.min <= curr.close < prev.max)
+    sorted_history: list[TradingViewPriceCandle] | None = None,
+    i: int | None = None,
+) -> tuple[
+    bool,
+    TradingViewPriceCandle | None,
+    TradingViewPriceCandle | None,
+    bool,
+]:  
+    # Candle 2 runs candle 1's high, closes back inside range, and does not run the low.
+    is_potential_setup = (
+        (curr.max > prev.max) and (prev.min <= curr.close < prev.max) and (curr.min >= prev.min)
+    )
+
+    if is_potential_setup:
+        return True, None, None, False
+
+    if sorted_history is None:
+        return False, None, None, False
+
+    start_index = i
+    if start_index is None:
+        start_index = next(
+            (index for index, candle in enumerate(sorted_history) if candle.time == curr.time),
+            None,
+        )
+
+    if start_index is None:
+        return False, None, None, False
+
+    for j in range(start_index, len(sorted_history) - 1):
+        candidate = sorted_history[j]
+        candidate_is_potential_setup = (
+            (candidate.max > prev.max)
+            and (prev.min <= candidate.close < prev.max)
+            and (candidate.min >= prev.min)
+        )
+
+        if candidate_is_potential_setup:
+            return True, candidate, sorted_history[j + 1], True
+
+        if candidate.min < prev.min or candidate.max > prev.max:
+            return False, None, None, True
+
+    return False, None, None, True
+
 
 
 def evaluate_bullish_triple_m_case(
@@ -756,10 +839,34 @@ def evaluate_bullish_triple_m_case(
     curr: TradingViewPriceCandle,
     next_candle: TradingViewPriceCandle,
     sorted_history: list[TradingViewPriceCandle] | None = None,
-    i: int | None = None
-) -> AnalysisCaseResult:
-    if not is_bullish_potential_setup_tm(prev, curr):
-        return None, None, False
+    i: int | None = None,
+) -> tuple[
+    bool | None,
+    TradingViewPriceCandle | None,
+    TradingViewPriceCandle | None,
+    bool,
+    bool,
+]:
+    is_potential_setup, new_curr, new_next_candle, inside_bar = is_bullish_potential_setup_tm(
+        prev, curr, sorted_history, i
+    )
+
+    if not is_potential_setup:
+        return None, None, None, False, inside_bar
+
+    replacement_curr = None
+    replacement_next = None
+    if new_curr is not None:
+        replacement_curr = new_curr
+        curr = new_curr
+        if sorted_history is not None:
+            i = next(
+                (index for index, candle in enumerate(sorted_history) if candle.time == curr.time),
+                i,
+            )
+    if new_next_candle is not None:
+        replacement_next = new_next_candle
+        next_candle = new_next_candle
     
     target = prev.min + ((prev.max- prev.min) / 2)
 
@@ -776,36 +883,36 @@ def evaluate_bullish_triple_m_case(
 
     # candle 3 hit the target and high came first.
     if next_candle.max > target and next_candle.high_before is True:
-        return True, None, False
+        return True, replacement_curr, replacement_next, False, inside_bar
     # candle 3 hit the target and did not hit low of candle 2 (even though low came first)
     if next_candle.max > target and next_candle.min >= curr.min:
-        return True, None, False 
+        return True, replacement_curr, replacement_next, False, inside_bar
      # candle 3 ran the second candle low before validation, so the setup failed immediately.
     if next_candle.min < curr.min:
-        return False, None, False
+        return False, replacement_curr, replacement_next, False, inside_bar
     
     # Don't check for subsequent consolidation candles without full history context.
     if sorted_history is None or i is None or i == len(sorted_history) - 2:
-        return False, None, False
+        return False, replacement_curr, replacement_next, False, inside_bar
     
-     # Third candle did not resolve the setup, so scan subsequent candles until consolidation breaks.
+    # Third candle did not resolve the setup, so scan subsequent candles until consolidation breaks.
     j = i + 2
     while j < len(sorted_history):
         cons_candle = sorted_history[j]
 
         # Cons candle high hit the target and high came first.
         if cons_candle.max > target and cons_candle.high_before is True:
-            return True, cons_candle, True
+            return True, replacement_curr, cons_candle, True, inside_bar
         # Cons candle hit the target and did not hit low of candle 2 (even though low came first)
         if cons_candle.max > target and cons_candle.min >= curr.min:
-            return True, cons_candle, True
+            return True, replacement_curr, cons_candle, True, inside_bar
         # Cons candle failed the setup
         if cons_candle.min < curr.min:
-            return False, cons_candle, True
+            return False, replacement_curr, cons_candle, True, inside_bar
 
         j += 1
 
-    return False, None, True
+    return False, replacement_curr, replacement_next, True, inside_bar
 
 
 
@@ -814,56 +921,80 @@ def evaluate_bearish_triple_m_case(
     curr: TradingViewPriceCandle,
     next_candle: TradingViewPriceCandle,
     sorted_history: list[TradingViewPriceCandle] | None = None,
-    i: int | None = None
-) -> AnalysisCaseResult:
-    if not is_bearish_potential_setup_tm(prev, curr):
-        return None, None, False
+    i: int | None = None,
+) -> tuple[
+    bool | None,
+    TradingViewPriceCandle | None,
+    TradingViewPriceCandle | None,
+    bool,
+    bool,
+]:
+    is_potential_setup, new_curr, new_next_candle, inside_bar = is_bearish_potential_setup_tm(
+        prev, curr, sorted_history, i
+    )
 
-    target = prev.min + ((prev.max- prev.min) / 2)
+    if not is_potential_setup:
+        return None, None, None, False, inside_bar
 
+    replacement_curr = None
+    replacement_next = None
+    if new_curr is not None:
+        replacement_curr = new_curr
+        curr = new_curr
+        if sorted_history is not None:
+            i = next(
+                (index for index, candle in enumerate(sorted_history) if candle.time == curr.time),
+                i,
+            )
+    if new_next_candle is not None:
+        replacement_next = new_next_candle
+        next_candle = new_next_candle
+
+    target = prev.min + ((prev.max - prev.min) / 2)
+    
     # Determine target
 
     # Scenario 1: candle 2 did not hit %50 of candle 1, target is still %50 of candle 1 
     if curr.min >= target:
         pass
     
-    # Scenario 2: candle 2 already hit %50 of candle 1, target is high of candle 2
+    # Scenario 2: candle 2 already hit %50 of candle 1, target is low of candle 2
     elif curr.min < target: 
         target = curr.min
     
 
     # candle 3 hit the target and low came first.
     if next_candle.min < target and next_candle.high_before is False:
-        return True, None, False
+        return True, replacement_curr, replacement_next, False, inside_bar
     # candle 3 hit the target and did not hit high of candle 2 (even though high came first)
     if next_candle.min < target and next_candle.max <= curr.max:
-        return True, None, False 
+        return True, replacement_curr, replacement_next, False, inside_bar
      # candle 3 ran the second candle high before validation, so the setup failed immediately.
     if next_candle.max > curr.max:
-        return False, None, False
+        return False, replacement_curr, replacement_next, False, inside_bar
     
     # Don't check for subsequent consolidation candles without full history context.
     if sorted_history is None or i is None or i == len(sorted_history) - 2:
-        return False, None, False
+        return False, replacement_curr, replacement_next, False, inside_bar
     
-     # Third candle did not resolve the setup, so scan subsequent candles until consolidation breaks.
+    # Third candle did not resolve the setup, so scan subsequent candles.
     j = i + 2
     while j < len(sorted_history):
         cons_candle = sorted_history[j]
 
         # Cons candle hit the target and low came first.
         if cons_candle.min < target and cons_candle.high_before is False:
-            return True, cons_candle, True
+            return True, replacement_curr, cons_candle, True, inside_bar
         # Cons candle hit the target and did not hit high of candle 2 (even though high came first)
         if cons_candle.min < target and cons_candle.max <= curr.max:
-            return True, cons_candle, True
+            return True, replacement_curr, cons_candle, True, inside_bar
         # Cons candle failed the setup
         if cons_candle.max > curr.max:
-            return False, cons_candle, True
+            return False, replacement_curr, cons_candle, True, inside_bar
 
         j += 1
 
-    return False, None, True
+    return False, replacement_curr, replacement_next, True, inside_bar
 
 
 def is_bullish_potential_setup_en(
@@ -1015,17 +1146,26 @@ def generate_screenshot_url(
     execution: TradingViewAnalysisExecution,
 ) -> str | None:
 
-    # extract execution bound times
-    prev_date_unix_seconds = execution.prev.time
-    next_date_unix_seconds = execution.next_candle.time
+    # Use all execution candles so delayed inside-bar and consolidation cases
+    # highlight the full setup window, not only the original 3-candle indexes.
+    setup_start_unix_seconds = min(
+        execution.prev.time,
+        execution.curr.time,
+        execution.next_candle.time,
+    )
+    setup_end_unix_seconds = max(
+        execution.prev.time,
+        execution.curr.time,
+        execution.next_candle.time,
+    )
 
     analysis_type = asset.analysis_type
     context_history = sorted(asset.context_history, key=lambda candle: candle.time)
 
     # calculate padded start_date and end_date
     start_window_weeks, end_window_weeks = SCREENSHOT_PADDING_WINDOW_WEEKS[analysis_type]
-    padded_start_date = prev_date_unix_seconds - (604800 * start_window_weeks)
-    padded_end_date = next_date_unix_seconds + (604800 * end_window_weeks)
+    padded_start_date = setup_start_unix_seconds - (604800 * start_window_weeks)
+    padded_end_date = setup_end_unix_seconds + (604800 * end_window_weeks)
     
     start_index = next(
         (i for i, history_item in enumerate(context_history)
@@ -1045,12 +1185,12 @@ def generate_screenshot_url(
     # transform data
     data = transform_candles_to_dataframe(context_window)
 
-    prev_date = execution.prev_date.strftime("%Y-%m-%d")
-    next_date = execution.next_date.strftime("%Y-%m-%d")
-
     # plot and save image to cloudinary
-    buffer = plot_to_png_buffer(data, prev_date, next_date)
-    public_id = f"{asset.pair}_{execution.direction}_{execution.curr.time}"
+    buffer = plot_to_png_buffer(data, setup_start_unix_seconds, setup_end_unix_seconds)
+    public_id = (
+        f"{asset.pair}_{execution.direction}_"
+        f"{setup_start_unix_seconds}_{execution.curr.time}_{setup_end_unix_seconds}"
+    )
     
     return upload_chart_image(buffer, public_id)
 
@@ -1098,8 +1238,10 @@ async def analyze_price_data(
             next_candle = sorted_history[i + 1]
 
             for direction in get_directions_for_bias(bias):
+                execution_curr_candle = curr
                 execution_next_candle = next_candle
                 consolidation = False
+                inside_bar = False
                 # Bullish Engulfing Analysis
                 if payload.analysis_type == "Bullish Engulfing" and direction == "Bullish":
                     success, replacement_next_candle, consolidation = (
@@ -1128,28 +1270,44 @@ async def analyze_price_data(
                         execution_next_candle = replacement_next_candle
                 # Bullish Triple M Analysis
                 elif payload.analysis_type == "Triple M" and direction == "Bullish":
-                    success, replacement_next_candle, consolidation = (
+                    (
+                        success,
+                        replacement_curr_candle,
+                        replacement_next_candle,
+                        consolidation,
+                        inside_bar,
+                    ) = (
                         evaluate_bullish_triple_m_case(
                             prev,
                             curr,
                             next_candle,
                             sorted_history,
-                            i
+                            i,
                         )
                     )
+                    if replacement_curr_candle is not None:
+                        execution_curr_candle = replacement_curr_candle
                     if replacement_next_candle is not None:
                         execution_next_candle = replacement_next_candle
                 # Bearish Triple M Analysis
                 elif payload.analysis_type == "Triple M" and direction == "Bearish":
-                    success, replacement_next_candle, consolidation = (
+                    (
+                        success,
+                        replacement_curr_candle,
+                        replacement_next_candle,
+                        consolidation,
+                        inside_bar,
+                    ) = (
                         evaluate_bearish_triple_m_case(
                             prev,
                             curr,
                             next_candle,
                             sorted_history,
-                            i
+                            i,
                         )
                     )
+                    if replacement_curr_candle is not None:
+                        execution_curr_candle = replacement_curr_candle
                     if replacement_next_candle is not None:
                         execution_next_candle = replacement_next_candle
                 else:
@@ -1168,11 +1326,12 @@ async def analyze_price_data(
                         direction=direction,
                         success=success,
                         consolidation=consolidation,
+                        inside_bar=inside_bar,
                         prev=prev,
-                        curr=curr,
+                        curr=execution_curr_candle,
                         next_candle=execution_next_candle,
                         prev_date=unix_seconds_to_date(prev.time),
-                        curr_date=unix_seconds_to_date(curr.time),
+                        curr_date=unix_seconds_to_date(execution_curr_candle.time),
                         next_date=unix_seconds_to_date(execution_next_candle.time),
                     )
                 )

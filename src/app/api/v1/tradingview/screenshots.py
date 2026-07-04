@@ -42,8 +42,35 @@ def upload_chart_image(buffer: io.BytesIO, public_id: str) -> str:
     return result["secure_url"]
 
 
-def plot_to_png_buffer(data, prev_date, next_date) -> io.BytesIO:
+def build_setup_highlight(data, prev_time: int, next_time: int) -> dict | None:
+    if data.empty:
+        return None
+
+    prev_timestamp = pd.to_datetime(prev_time, unit="s", utc=True)
+    next_timestamp = pd.to_datetime(next_time, unit="s", utc=True)
+    setup_mask = (data.index >= prev_timestamp) & (data.index <= next_timestamp)
+
+    if not setup_mask.any():
+        return None
+
+    setup_window = data.loc[setup_mask]
+    setup_low = setup_window["Low"].min()
+    setup_high = setup_window["High"].max()
+
+    return {
+        "y1": [setup_low] * len(data),
+        "y2": [setup_high] * len(data),
+        "where": setup_mask,
+        "color": "#d9d9d9",
+        "alpha": 0.5,
+        "linewidth": 0,
+        "zorder": 0.5,
+    }
+
+
+def plot_to_png_buffer(data, prev_time: int, next_time: int) -> io.BytesIO:
     buffer = io.BytesIO()
+    setup_highlight = build_setup_highlight(data, prev_time, next_time)
 
     kwargs = dict(
         type="candle",
@@ -55,8 +82,9 @@ def plot_to_png_buffer(data, prev_date, next_date) -> io.BytesIO:
             "bbox_inches": "tight",
         },
         datetime_format="%Y-%m-%d",
-        vlines=dict(vlines=[prev_date, next_date], linewidths=(2, 2)),
     )
+    if setup_highlight is not None:
+        kwargs["fill_between"] = setup_highlight
 
     mpf.plot(
         data,

@@ -24,6 +24,10 @@ class Settings(BaseSettings):
         "https://mattdavis207.app.n8n.cloud/webhook/"
         "2b0a8594-f02c-4528-a30b-1971fa379fd9"
     )
+    analysis_webhook_test_url: AnyHttpUrl = (
+        "https://mattdavis207.app.n8n.cloud/webhook-test/"
+        "2b0a8594-f02c-4528-a30b-1971fa379fd9"
+    )
     jsonplaceholder_base_url: AnyHttpUrl = "https://jsonplaceholder.typicode.com"
     youtube_webshare_proxy_username: str | None = None
     youtube_webshare_proxy_password: str | None = None

@@ -1,9 +1,9 @@
 import json
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 
@@ -14,6 +14,7 @@ APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parents[1]
 CURRENCY_PAIRS_PATH = PROJECT_ROOT / "currency_pairs.json"
 EXCHANGES_PATH = PROJECT_ROOT / "exchanges.json"
+WebhookEnvironment = Literal["prod", "test"]
 
 
 def get_cors_allow_origins() -> list[str]:
@@ -27,9 +28,20 @@ def get_cors_allow_origins() -> list[str]:
     ]
 
 
-async def post_analysis_webhook(payload: dict[str, Any]) -> int:
+def get_analysis_webhook_url(webhook_environment: WebhookEnvironment) -> str:
+    if webhook_environment == "test":
+        return str(settings.analysis_webhook_test_url)
+
+    return str(settings.analysis_webhook_url)
+
+
+async def post_analysis_webhook(
+    payload: dict[str, Any],
+    webhook_environment: WebhookEnvironment = "prod",
+) -> int:
+    webhook_url = get_analysis_webhook_url(webhook_environment)
     async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
-        response = await client.post(str(settings.analysis_webhook_url), json=payload)
+        response = await client.post(webhook_url, json=payload)
     response.raise_for_status()
     return response.status_code
 
@@ -69,9 +81,15 @@ def create_app() -> FastAPI:
             return json.load(file)
 
     @app.post("/analysis-webhook", tags=["analysis"])
-    async def analysis_webhook(payload: dict[str, Any]) -> dict[str, int | str]:
+    async def analysis_webhook(
+        payload: dict[str, Any],
+        webhook_environment: Annotated[
+            WebhookEnvironment,
+            Query(description="Use prod for the production n8n webhook or test for webhook-test."),
+        ] = "prod",
+    ) -> dict[str, int | str]:
         try:
-            webhook_status_code = await post_analysis_webhook(payload)
+            webhook_status_code = await post_analysis_webhook(payload, webhook_environment)
         except httpx.HTTPStatusError as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,

@@ -8,11 +8,11 @@ AnalysisDirection = Literal["Bullish", "Bearish"]
 
 ANALYSIS_CONTEXT_WINDOWS_WEEKS: dict[AnalysisType, tuple[int, int]] = {
     "Bullish Engulfing": (12, 6),
-    "Triple M": (0, 0),
+    "Triple M": (12, 6),
 }
 SCREENSHOT_PADDING_WINDOW_WEEKS: dict[AnalysisType, tuple[int, int]] = {
     "Bullish Engulfing": (10, 5),
-    "Triple M": (0, 0),
+    "Triple M": (8, 4),
 }
 
 PRICE_ENDPOINT: str = "/api/price"
