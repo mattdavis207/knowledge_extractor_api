@@ -80,6 +80,14 @@ currency_pairs_cache: dict[
     CurrencyPairsCacheKey,
     tuple[float, list["TradingViewCurrencyPair"], int | None],
 ] = {}
+RETRYABLE_PRICE_STATUS_CODES = {
+    status.HTTP_429_TOO_MANY_REQUESTS,
+    status.HTTP_500_INTERNAL_SERVER_ERROR,
+    status.HTTP_502_BAD_GATEWAY,
+    status.HTTP_503_SERVICE_UNAVAILABLE,
+    status.HTTP_504_GATEWAY_TIMEOUT,
+}
+
 
 def get_tradingview_headers() -> dict[str, str]:
     if not settings.tradingview_rapidapi_key:
@@ -364,7 +372,7 @@ async def fetch_tradingview_price_history_or_raise(
             return await fetch_tradingview_price_history(**kwargs)
         except httpx.HTTPStatusError as exc:
             if (
-                exc.response.status_code != status.HTTP_429_TOO_MANY_REQUESTS
+                exc.response.status_code not in RETRYABLE_PRICE_STATUS_CODES
                 or attempt >= max_retries
             ):
                 raise_tradingview_http_error(exc)
@@ -382,6 +390,67 @@ async def fetch_tradingview_price_history_or_raise(
         status_code=status.HTTP_502_BAD_GATEWAY,
         detail="TradingView API request failed.",
     )
+
+
+async def fetch_tradingview_price_history_window_or_raise(
+    *,
+    max_candles_per_request: int,
+    request_delay_seconds: float,
+    candle_range: int,
+    target_timestamp: int,
+    timeframe: str,
+    **kwargs,
+) -> list[dict]:
+    if candle_range <= max_candles_per_request:
+        return await fetch_tradingview_price_history_or_raise(
+            candle_range=candle_range,
+            target_timestamp=target_timestamp,
+            timeframe=timeframe,
+            **kwargs,
+        )
+
+    timeframe_seconds = timeframe_to_seconds(timeframe)
+    if timeframe_seconds is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported TradingView price timeframe: {timeframe}",
+        )
+
+    history_by_time: dict[int, dict] = {}
+    remaining_range = candle_range
+    current_target_timestamp = target_timestamp
+
+    while remaining_range > 0:
+        chunk_range = min(remaining_range, max_candles_per_request)
+        chunk_history = await fetch_tradingview_price_history_or_raise(
+            candle_range=chunk_range,
+            target_timestamp=current_target_timestamp,
+            timeframe=timeframe,
+            **kwargs,
+        )
+
+        chunk_times = []
+        for candle in chunk_history:
+            candle_time = get_candle_time(candle)
+            if candle_time is None:
+                continue
+
+            history_by_time[candle_time] = candle
+            chunk_times.append(candle_time)
+
+        remaining_range -= chunk_range
+        if remaining_range <= 0:
+            break
+
+        if chunk_times:
+            current_target_timestamp = min(chunk_times) - 1
+        else:
+            current_target_timestamp -= chunk_range * timeframe_seconds
+
+        if request_delay_seconds > 0:
+            await asyncio.sleep(request_delay_seconds)
+
+    return [history_by_time[candle_time] for candle_time in sorted(history_by_time)]
 
 
 @router.get(
@@ -560,9 +629,13 @@ async def get_price_data_for_assets(
             if upstream_request_count > 0 and delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
 
-            history = await fetch_tradingview_price_history_or_raise(
+            history = await fetch_tradingview_price_history_window_or_raise(
                 max_retries=settings.tradingview_price_request_max_retries,
                 retry_delay_seconds=settings.tradingview_price_request_retry_delay_seconds,
+                max_candles_per_request=(
+                    settings.tradingview_price_request_max_candles_per_request
+                ),
+                request_delay_seconds=delay_seconds,
                 client=client,
                 base_url=base_url,
                 headers=headers,
@@ -606,9 +679,13 @@ async def get_price_data_for_assets(
                 if upstream_request_count > 0 and delay_seconds > 0:
                     await asyncio.sleep(delay_seconds)
 
-                lower_timeframe_history = await fetch_tradingview_price_history_or_raise(
+                lower_timeframe_history = await fetch_tradingview_price_history_window_or_raise(
                     max_retries=settings.tradingview_price_request_max_retries,
                     retry_delay_seconds=settings.tradingview_price_request_retry_delay_seconds,
+                    max_candles_per_request=(
+                        settings.tradingview_price_request_max_candles_per_request
+                    ),
+                    request_delay_seconds=delay_seconds,
                     client=client,
                     base_url=base_url,
                     headers=headers,

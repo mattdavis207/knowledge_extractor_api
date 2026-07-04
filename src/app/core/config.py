@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     tradingview_price_request_delay_seconds: float = Field(default=1.0, ge=0)
     tradingview_price_request_max_retries: int = Field(default=2, ge=0)
     tradingview_price_request_retry_delay_seconds: float = Field(default=10.0, ge=0)
+    tradingview_price_request_max_candles_per_request: int = Field(default=1500, ge=1)
     analysis_webhook_url: AnyHttpUrl = (
         "https://mattdavis207.app.n8n.cloud/webhook/"
         "2b0a8594-f02c-4528-a30b-1971fa379fd9"
