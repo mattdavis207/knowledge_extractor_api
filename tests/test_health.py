@@ -53,6 +53,16 @@ def test_local_currency_pairs_json_route() -> None:
     assert len(response.json()["currency_pairs"]) == 2512
 
 
+def test_local_trading_assets_json_route() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/trading-assets.json")
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 15
+    assert any(asset["ticker"] == "NAS100" for asset in response.json()["assets"])
+
+
 def test_local_exchanges_json_route() -> None:
     client = TestClient(create_app())
 
@@ -64,10 +74,10 @@ def test_local_exchanges_json_route() -> None:
 
 
 def test_analysis_webhook_proxy_posts_payload(monkeypatch) -> None:
-    async def stub_post_analysis_webhook(payload: dict, webhook_environment: str) -> int:
+    async def stub_post_analysis_webhook(payload: dict, webhook_environment: str) -> tuple[int, dict]:
         assert payload == {"assets": ["FX:EURUSD"]}
         assert webhook_environment == "prod"
-        return 200
+        return 200, {"execution_url": "https://n8n.example/execution/123"}
 
     monkeypatch.setattr(app.main, "post_analysis_webhook", stub_post_analysis_webhook)
 
@@ -75,14 +85,19 @@ def test_analysis_webhook_proxy_posts_payload(monkeypatch) -> None:
     response = client.post("/analysis-webhook", json={"assets": ["FX:EURUSD"]})
 
     assert response.status_code == 200
-    assert response.json() == {"status": "sent", "webhook_status_code": 200}
+    assert response.json() == {
+        "status": "sent",
+        "webhook_status_code": 200,
+        "webhook_response": {"execution_url": "https://n8n.example/execution/123"},
+        "execution_url": "https://n8n.example/execution/123",
+    }
 
 
 def test_analysis_webhook_proxy_supports_test_webhook_flag(monkeypatch) -> None:
-    async def stub_post_analysis_webhook(payload: dict, webhook_environment: str) -> int:
+    async def stub_post_analysis_webhook(payload: dict, webhook_environment: str) -> tuple[int, dict]:
         assert payload == {"assets": ["FX:EURUSD"]}
         assert webhook_environment == "test"
-        return 200
+        return 200, {}
 
     monkeypatch.setattr(app.main, "post_analysis_webhook", stub_post_analysis_webhook)
 
@@ -93,4 +108,8 @@ def test_analysis_webhook_proxy_supports_test_webhook_flag(monkeypatch) -> None:
     )
 
     assert response.status_code == 200
-    assert response.json() == {"status": "sent", "webhook_status_code": 200}
+    assert response.json() == {
+        "status": "sent",
+        "webhook_status_code": 200,
+        "webhook_response": {},
+    }

@@ -11,6 +11,7 @@ import mplfinance as mpf
 import pandas as pd
 
 from app.api.v1.tradingview.schemas import TradingViewPriceCandle
+from app.api.v1.tradingview.utils import candle_label_date
 from app.core.config import settings
 
 
@@ -42,12 +43,27 @@ def upload_chart_image(buffer: io.BytesIO, public_id: str) -> str:
     return result["secure_url"]
 
 
-def build_setup_highlight(data, prev_time: int, next_time: int) -> dict | None:
+def candle_timestamp_to_plot_datetime(
+    timestamp: int,
+    timeframe: str | None = None,
+) -> pd.Timestamp:
+    if timeframe in {"D", "W", "M"}:
+        return pd.Timestamp(candle_label_date(timestamp, timeframe), tz="UTC")
+
+    return pd.to_datetime(timestamp, unit="s", utc=True)
+
+
+def build_setup_highlight(
+    data,
+    prev_time: int,
+    next_time: int,
+    timeframe: str | None = None,
+) -> dict | None:
     if data.empty:
         return None
 
-    prev_timestamp = pd.to_datetime(prev_time, unit="s", utc=True)
-    next_timestamp = pd.to_datetime(next_time, unit="s", utc=True)
+    prev_timestamp = candle_timestamp_to_plot_datetime(prev_time, timeframe)
+    next_timestamp = candle_timestamp_to_plot_datetime(next_time, timeframe)
     setup_mask = (data.index >= prev_timestamp) & (data.index <= next_timestamp)
 
     if not setup_mask.any():
@@ -68,9 +84,14 @@ def build_setup_highlight(data, prev_time: int, next_time: int) -> dict | None:
     }
 
 
-def plot_to_png_buffer(data, prev_time: int, next_time: int) -> io.BytesIO:
+def plot_to_png_buffer(
+    data,
+    prev_time: int,
+    next_time: int,
+    timeframe: str | None = None,
+) -> io.BytesIO:
     buffer = io.BytesIO()
-    setup_highlight = build_setup_highlight(data, prev_time, next_time)
+    setup_highlight = build_setup_highlight(data, prev_time, next_time, timeframe)
 
     kwargs = dict(
         type="candle",
@@ -98,12 +119,13 @@ def plot_to_png_buffer(data, prev_time: int, next_time: int) -> io.BytesIO:
 
 def transform_candles_to_dataframe(
     candles: list[TradingViewPriceCandle],
+    timeframe: str | None = None,
 ):
     rows = []
     for candle in candles:
         rows.append(
             {
-                "Date": pd.to_datetime(candle.time, unit="s", utc=True),
+                "Date": candle_timestamp_to_plot_datetime(candle.time, timeframe),
                 "Open": candle.open,
                 "High": candle.max,
                 "Low": candle.min,

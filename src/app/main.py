@@ -13,6 +13,7 @@ from app.core.config import settings
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parents[1]
 CURRENCY_PAIRS_PATH = PROJECT_ROOT / "currency_pairs.json"
+TRADING_ASSETS_PATH = PROJECT_ROOT / "trading_assets.json"
 EXCHANGES_PATH = PROJECT_ROOT / "exchanges.json"
 WebhookEnvironment = Literal["prod", "test"]
 
@@ -38,12 +39,18 @@ def get_analysis_webhook_url(webhook_environment: WebhookEnvironment) -> str:
 async def post_analysis_webhook(
     payload: dict[str, Any],
     webhook_environment: WebhookEnvironment = "prod",
-) -> int:
+) -> tuple[int, Any]:
     webhook_url = get_analysis_webhook_url(webhook_environment)
     async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
         response = await client.post(webhook_url, json=payload)
     response.raise_for_status()
-    return response.status_code
+
+    try:
+        response_payload = response.json()
+    except ValueError:
+        response_payload = response.text
+
+    return response.status_code, response_payload
 
 
 def create_app() -> FastAPI:
@@ -75,6 +82,11 @@ def create_app() -> FastAPI:
         with CURRENCY_PAIRS_PATH.open(encoding="utf-8") as file:
             return json.load(file)
 
+    @app.get("/trading-assets.json", tags=["local-data"])
+    async def trading_assets() -> dict:
+        with TRADING_ASSETS_PATH.open(encoding="utf-8") as file:
+            return json.load(file)
+
     @app.get("/exchanges.json", tags=["local-data"])
     async def exchanges() -> dict:
         with EXCHANGES_PATH.open(encoding="utf-8") as file:
@@ -87,9 +99,12 @@ def create_app() -> FastAPI:
             WebhookEnvironment,
             Query(description="Use prod for the production n8n webhook or test for webhook-test."),
         ] = "prod",
-    ) -> dict[str, int | str]:
+    ) -> dict[str, Any]:
         try:
-            webhook_status_code = await post_analysis_webhook(payload, webhook_environment)
+            webhook_status_code, webhook_response = await post_analysis_webhook(
+                payload,
+                webhook_environment,
+            )
         except httpx.HTTPStatusError as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -101,10 +116,16 @@ def create_app() -> FastAPI:
                 detail="Analysis webhook request failed.",
             ) from exc
 
-        return {
+        response_payload: dict[str, Any] = {
             "status": "sent",
             "webhook_status_code": webhook_status_code,
+            "webhook_response": webhook_response,
         }
+
+        if isinstance(webhook_response, dict) and webhook_response.get("execution_url"):
+            response_payload["execution_url"] = webhook_response["execution_url"]
+
+        return response_payload
 
     @app.get("/health", tags=["health"])
     async def health_check() -> dict[str, str]:

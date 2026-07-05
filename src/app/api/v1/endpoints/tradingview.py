@@ -1523,6 +1523,7 @@ def generate_screenshot_url(
         execution.timeframe or asset.timeframe,
         context_history,
     )
+    screenshot_timeframe = execution.timeframe or asset.timeframe
 
     # calculate padded start_date and end_date
     start_window, end_window = SCREENSHOT_PADDING_WINDOW_WEEKS[analysis_type]
@@ -1545,10 +1546,15 @@ def generate_screenshot_url(
     context_window = context_history[start_index: end_index+1]
 
     # transform data
-    data = transform_candles_to_dataframe(context_window)
+    data = transform_candles_to_dataframe(context_window, screenshot_timeframe)
 
     # plot and save image to cloudinary
-    buffer = plot_to_png_buffer(data, setup_start_unix_seconds, setup_end_unix_seconds)
+    buffer = plot_to_png_buffer(
+        data,
+        setup_start_unix_seconds,
+        setup_end_unix_seconds,
+        screenshot_timeframe,
+    )
     public_id = (
         f"{asset.pair}_{execution.direction}_"
         f"{setup_start_unix_seconds}_{execution.curr.time}_{setup_end_unix_seconds}"

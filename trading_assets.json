@@ -1,0 +1,125 @@
+{
+  "count": 15,
+  "assets": [
+    {
+      "symbol": "BITSTAMP:BTCUSD",
+      "exchange": "BITSTAMP",
+      "ticker": "BTCUSD",
+      "label": "Bitcoin / U.S. Dollar (BITSTAMP:BTCUSD)",
+      "description": "Bitcoin / U.S. Dollar",
+      "asset_type": "crypto_commodities"
+    },
+    {
+      "symbol": "BITSTAMP:ETHUSD",
+      "exchange": "BITSTAMP",
+      "ticker": "ETHUSD",
+      "label": "Ethereum / U.S. Dollar (BITSTAMP:ETHUSD)",
+      "description": "Ethereum / U.S. Dollar",
+      "asset_type": "crypto_commodities"
+    },
+    {
+      "symbol": "OANDA:BCOUSD",
+      "exchange": "OANDA",
+      "ticker": "BRENT",
+      "label": "Crude Oil Brent Cash (OANDA:BCOUSD)",
+      "description": "Crude Oil Brent Cash",
+      "asset_type": "crypto_commodities"
+    },
+    {
+      "symbol": "OANDA:WTICOUSD",
+      "exchange": "OANDA",
+      "ticker": "WTI",
+      "label": "West Texas Intermediate Crude Oil Cash (OANDA:WTICOUSD)",
+      "description": "West Texas Intermediate Crude Oil Cash",
+      "asset_type": "crypto_commodities"
+    },
+    {
+      "symbol": "OANDA:XAUUSD",
+      "exchange": "OANDA",
+      "ticker": "XAUUSD",
+      "label": "Gold Spot / U.S. Dollar (OANDA:XAUUSD)",
+      "description": "Gold Spot / U.S. Dollar",
+      "asset_type": "crypto_commodities"
+    },
+    {
+      "symbol": "FOREXCOM:XAGUSD",
+      "exchange": "FOREXCOM",
+      "ticker": "XAGUSD",
+      "label": "Silver / U.S. Dollar (FOREXCOM:XAGUSD)",
+      "description": "Silver / U.S. Dollar",
+      "asset_type": "crypto_commodities"
+    },
+    {
+      "symbol": "FOREXCOM:NSXUSD",
+      "exchange": "FOREXCOM",
+      "ticker": "NAS100",
+      "label": "NASDAQ 100 Index (FOREXCOM:NSXUSD)",
+      "description": "NASDAQ 100 Index",
+      "asset_type": "indices"
+    },
+    {
+      "symbol": "OANDA:SPX500USD",
+      "exchange": "OANDA",
+      "ticker": "SPX500",
+      "label": "S&P 500 Index (OANDA:SPX500USD)",
+      "description": "S&P 500 Index",
+      "asset_type": "indices"
+    },
+    {
+      "symbol": "FOREXCOM:DJI",
+      "exchange": "FOREXCOM",
+      "ticker": "US30",
+      "label": "Dow Jones Industrial Average Index (FOREXCOM:DJI)",
+      "description": "Dow Jones Industrial Average Index",
+      "asset_type": "indices"
+    },
+    {
+      "symbol": "FOREXCOM:ESP35",
+      "exchange": "FOREXCOM",
+      "ticker": "ESP35",
+      "label": "IBEX 35 Index (FOREXCOM:ESP35)",
+      "description": "IBEX 35 Index",
+      "asset_type": "indices"
+    },
+    {
+      "symbol": "FOREXCOM:JPXJPY",
+      "exchange": "FOREXCOM",
+      "ticker": "JPN225",
+      "label": "Nikkei 225 Index (FOREXCOM:JPXJPY)",
+      "description": "Nikkei 225 Index",
+      "asset_type": "indices"
+    },
+    {
+      "symbol": "OANDA:FR40EUR",
+      "exchange": "OANDA",
+      "ticker": "FRA40",
+      "label": "CAC 40 Index (OANDA:FR40EUR)",
+      "description": "CAC 40 Index",
+      "asset_type": "indices"
+    },
+    {
+      "symbol": "OANDA:EU50EUR",
+      "exchange": "OANDA",
+      "ticker": "EUSTX50",
+      "label": "Euro Stoxx 50 Index (OANDA:EU50EUR)",
+      "description": "Euro Stoxx 50 Index",
+      "asset_type": "indices"
+    },
+    {
+      "symbol": "FOREXCOM:UKXGBP",
+      "exchange": "FOREXCOM",
+      "ticker": "UK100",
+      "label": "FTSE 100 Index (FOREXCOM:UKXGBP)",
+      "description": "FTSE 100 Index",
+      "asset_type": "indices"
+    },
+    {
+      "symbol": "OANDA:DE30EUR",
+      "exchange": "OANDA",
+      "ticker": "GER30",
+      "label": "DAX Index (OANDA:DE30EUR)",
+      "description": "DAX Index",
+      "asset_type": "indices"
+    }
+  ]
+}

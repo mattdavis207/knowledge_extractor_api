@@ -158,7 +158,7 @@
 
     .asset-groups {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 16px;
       margin-top: 16px;
     }
@@ -330,6 +330,19 @@
       font-size: 0.95rem;
     }
 
+    .execution-link {
+      display: none;
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfdff;
+    }
+
+    .execution-link a {
+      color: var(--accent);
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
     pre {
       margin: 0;
       max-height: 360px;
@@ -432,6 +445,7 @@
 
         <section class="output" id="output">
           <h2>Submitted Data</h2>
+          <div class="execution-link" id="executionLink"></div>
           <pre id="outputJson"></pre>
         </section>
       </form>
@@ -441,6 +455,10 @@
   <script>
     const CURRENCY_PAIRS_ENDPOINT = new URL(
       "/currency-pairs.json",
+      window.location.origin
+    ).toString();
+    const TRADING_ASSETS_ENDPOINT = new URL(
+      "/trading-assets.json",
       window.location.origin
     ).toString();
     const EXCHANGES_ENDPOINT = new URL(
@@ -473,7 +491,8 @@
     const groups = [
       ["majors", "Majors"],
       ["minors", "Minors"],
-      ["exotics", "Exotics"]
+      ["crypto_commodities", "Crypto + Commodities"],
+      ["indices", "Indices"]
     ];
 
     const qs = (id) => document.getElementById(id);
@@ -494,14 +513,22 @@
     }
 
     function tickerFromSymbol(symbol) {
-      return String(symbol || "").split(":").pop().replace(/[^A-Z]/gi, "").toUpperCase();
+      return String(symbol || "").split(":").pop().replace(/[^A-Z0-9]/gi, "").toUpperCase();
     }
 
     function assetKey(asset) {
       return tickerFromSymbol(asset.symbol);
     }
 
+    function assetDisplaySymbol(asset) {
+      if (asset.ticker) return String(asset.ticker).replace(/[^A-Z0-9]/gi, "").toUpperCase();
+      return assetKey(asset);
+    }
+
     function classifyAsset(asset) {
+      if (asset.asset_type === "indices") return "indices";
+      if (asset.asset_type === "crypto_commodities") return "crypto_commodities";
+
       const ticker = assetKey(asset);
       if (MAJORS.has(ticker)) return "majors";
       const base = ticker.slice(0, 3);
@@ -518,22 +545,42 @@
       return exchange.desc || exchange.name || exchange.value;
     }
 
-    function getAssetConfig(key) {
+    function getAssetByKey(key) {
+      return state.assets.find((asset) => assetKey(asset) === key);
+    }
+
+    function usesAssetDefaultExchange(asset) {
+      return ["crypto_commodities", "indices"].includes(asset?.asset_type);
+    }
+
+    function getAssetConfig(key, asset = null) {
       if (!state.assetConfig[key]) {
+        const sourceAsset = asset || getAssetByKey(key);
         state.assetConfig[key] = {
-          exchange: state.defaultExchange,
+          exchange: usesAssetDefaultExchange(sourceAsset)
+            ? sourceAsset.exchange
+            : state.defaultExchange,
           bias: state.defaultBias
         };
       }
 
-      if (!state.assetConfig[key].exchange) state.assetConfig[key].exchange = state.defaultExchange;
+      if (!state.assetConfig[key].exchange) {
+        const sourceAsset = asset || getAssetByKey(key);
+        state.assetConfig[key].exchange = usesAssetDefaultExchange(sourceAsset)
+          ? sourceAsset.exchange
+          : state.defaultExchange;
+      }
       if (!state.assetConfig[key].bias) state.assetConfig[key].bias = state.defaultBias;
       return state.assetConfig[key];
     }
 
     function renderExchangeOptions(selectedValue) {
-      if (!state.exchanges.length) return '<option value="">No Forex exchanges loaded</option>';
-      return state.exchanges.map((exchange) => `
+      if (!state.exchanges.length) return '<option value="">No exchanges loaded</option>';
+      const hasSelectedValue = state.exchanges.some((exchange) => exchange.value === selectedValue);
+      const selectedOption = selectedValue && !hasSelectedValue
+        ? `<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(selectedValue)}</option>`
+        : "";
+      return selectedOption + state.exchanges.map((exchange) => `
         <option value="${escapeHtml(exchange.value)}" ${exchange.value === selectedValue ? "selected" : ""}>
           ${escapeHtml(exchangeLabel(exchange))}
         </option>
@@ -589,7 +636,11 @@
 
     function setRenderedSelectedConfig(field, value) {
       document.querySelectorAll(`#assetGroups select[data-config-field="${field}"]`).forEach((select) => {
-        if (state.selected.has(select.dataset.assetKey)) {
+        const asset = getAssetByKey(select.dataset.assetKey);
+        if (
+          state.selected.has(select.dataset.assetKey)
+          && !(field === "exchange" && usesAssetDefaultExchange(asset))
+        ) {
           select.value = value;
         }
       });
@@ -622,13 +673,16 @@
             ${grouped[key].map((asset) => {
               const key = assetKey(asset);
               const selected = state.selected.has(key);
-              const config = getAssetConfig(key);
+              const config = getAssetConfig(key, asset);
               return `
                 <div class="asset-option ${selected ? "selected" : ""}" data-asset-key="${escapeHtml(key)}">
                   <label class="asset-pick">
                     <input type="checkbox" value="${escapeHtml(key)}" ${selected ? "checked" : ""}>
                     <span>
-                      <span class="asset-symbol">${escapeHtml(key)}</span>
+                      <span class="asset-symbol">${escapeHtml(assetDisplaySymbol(asset))}</span>
+                      ${assetDisplaySymbol(asset) !== key ? `
+                        <span class="asset-name">${escapeHtml(key)}</span>
+                      ` : ""}
                       <span class="asset-name">${escapeHtml(labelForAsset(asset))}</span>
                     </span>
                   </label>
@@ -662,9 +716,18 @@
         const response = await fetch(CURRENCY_PAIRS_ENDPOINT);
         if (!response.ok) throw new Error(`Local currency pairs request failed: ${response.status}`);
         const payload = await response.json();
-        state.assets = (payload.currency_pairs || [])
+        const tradingAssetsResponse = await fetch(TRADING_ASSETS_ENDPOINT);
+        if (!tradingAssetsResponse.ok) {
+          throw new Error(`Local trading assets request failed: ${tradingAssetsResponse.status}`);
+        }
+        const tradingAssetsPayload = await tradingAssetsResponse.json();
+        state.assets = [
+          ...(payload.currency_pairs || []),
+          ...(tradingAssetsPayload.assets || [])
+        ]
           .filter((asset) => asset.symbol)
-          .sort((a, b) => a.symbol.localeCompare(b.symbol));
+          .filter((asset) => classifyAsset(asset) !== "exotics")
+          .sort((a, b) => assetKey(a).localeCompare(assetKey(b)));
         qs("assetError").textContent = "";
         renderAssets();
       } catch (error) {
@@ -678,7 +741,7 @@
       if (!response.ok) throw new Error(`Local exchanges request failed: ${response.status}`);
       const payload = await response.json();
       state.exchanges = (payload.exchanges || [])
-        .filter((exchange) => exchange.group === "Forex" && exchange.value)
+        .filter((exchange) => exchange.value && !exchange.hidden)
         .sort((a, b) => exchangeLabel(a).localeCompare(exchangeLabel(b)));
 
       const preferredExchange = state.exchanges.find((exchange) => exchange.value === "OANDA");
@@ -704,6 +767,22 @@
         : "";
       qs("dateError").textContent = message;
       return !message;
+    }
+
+    function setExecutionLink(url) {
+      const container = qs("executionLink");
+      if (!url) {
+        container.style.display = "none";
+        container.textContent = "";
+        return;
+      }
+
+      container.style.display = "block";
+      container.innerHTML = `
+        <a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">
+          Open n8n execution
+        </a>
+      `;
     }
 
     qs("assetGroups").addEventListener("change", (event) => {
@@ -733,7 +812,7 @@
       state.visible.forEach((asset) => {
         const key = assetKey(asset);
         state.selected.add(key);
-        getAssetConfig(key);
+        getAssetConfig(key, asset);
       });
       renderAssets({ preserveScroll: true });
     });
@@ -746,7 +825,10 @@
     qs("defaultExchange").addEventListener("change", () => {
       state.defaultExchange = qs("defaultExchange").value;
       state.selected.forEach((key) => {
-        getAssetConfig(key).exchange = state.defaultExchange;
+        const asset = getAssetByKey(key);
+        if (!usesAssetDefaultExchange(asset)) {
+          getAssetConfig(key).exchange = state.defaultExchange;
+        }
       });
       setRenderedSelectedConfig("exchange", state.defaultExchange);
     });
@@ -788,6 +870,7 @@
       };
 
       qs("output").style.display = "block";
+      setExecutionLink(null);
       qs("outputJson").textContent = JSON.stringify({
         ...submitted,
         webhook: { status: "sending" }
@@ -806,6 +889,7 @@
           throw new Error(webhookPayload.detail || `Webhook request failed: ${webhookResponse.status}`);
         }
 
+        setExecutionLink(webhookPayload.execution_url);
         qs("outputJson").textContent = JSON.stringify({
           ...submitted,
           webhook: {
@@ -815,6 +899,7 @@
         }, null, 2);
       } catch (error) {
         qs("assetError").textContent = `Webhook send failed: ${error.message}`;
+        setExecutionLink(null);
         qs("outputJson").textContent = JSON.stringify({
           ...submitted,
           webhook: {
@@ -837,6 +922,7 @@
       qs("assetError").textContent = "";
       qs("dateError").textContent = "";
       qs("output").style.display = "none";
+      setExecutionLink(null);
       setTimeout(renderAssets, 0);
     });
 
