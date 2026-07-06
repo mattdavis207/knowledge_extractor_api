@@ -95,6 +95,10 @@ ADAPTIVE_PRICE_CHUNK_STATUS_CODES = {
     status.HTTP_503_SERVICE_UNAVAILABLE,
     status.HTTP_504_GATEWAY_TIMEOUT,
 }
+RETRYABLE_PRICE_TRANSPORT_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+)
 
 
 def get_tradingview_headers() -> dict[str, str]:
@@ -438,9 +442,28 @@ async def fetch_tradingview_price_history_or_raise(
             wait_seconds = retry_after_seconds(exc.response) or retry_delay_seconds
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
-        except httpx.HTTPError as exc:
+        except RETRYABLE_PRICE_TRANSPORT_ERRORS as exc:
             logger.warning(
                 "TradingView price API request failed before receiving a valid response: "
+                "attempt=%s asset=%s timeframe=%s range=%s to=%s error=%s",
+                attempt + 1,
+                kwargs["asset"],
+                kwargs["timeframe"],
+                kwargs["candle_range"],
+                kwargs["target_timestamp"],
+                repr(exc),
+            )
+            if attempt >= max_retries:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="TradingView API request failed.",
+                ) from exc
+
+            if retry_delay_seconds > 0:
+                await asyncio.sleep(retry_delay_seconds)
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "TradingView price API request failed with a non-retryable client error: "
                 "asset=%s timeframe=%s range=%s to=%s error=%s",
                 kwargs["asset"],
                 kwargs["timeframe"],
