@@ -99,6 +99,7 @@ RETRYABLE_PRICE_TRANSPORT_ERRORS = (
     httpx.TimeoutException,
     httpx.NetworkError,
 )
+INTRADAY_TARGET_BOUNDARY_PADDING_SECONDS = 24 * 60 * 60
 
 
 def get_tradingview_headers() -> dict[str, str]:
@@ -112,6 +113,31 @@ def get_tradingview_headers() -> dict[str, str]:
         "x-rapidapi-host": settings.tradingview_rapidapi_host,
         "x-rapidapi-key": settings.tradingview_rapidapi_key,
     }
+
+
+def adjust_intraday_year_boundary_target_timestamp(target_timestamp: int) -> int:
+    target_date = unix_seconds_to_date(target_timestamp)
+    if (target_date.month, target_date.day) in {(1, 1), (12, 31)}:
+        return target_timestamp + INTRADAY_TARGET_BOUNDARY_PADDING_SECONDS
+
+    return target_timestamp
+
+
+def calculate_intraday_target_padding_range(
+    *,
+    original_target_timestamp: int,
+    adjusted_target_timestamp: int,
+    timeframe: str,
+) -> int:
+    if adjusted_target_timestamp <= original_target_timestamp:
+        return 0
+
+    timeframe_seconds = timeframe_to_seconds(timeframe)
+    if timeframe_seconds is None:
+        return 0
+
+    padding_seconds = adjusted_target_timestamp - original_target_timestamp
+    return (padding_seconds + timeframe_seconds - 1) // timeframe_seconds
 
 
 async def fetch_tradingview_metadata_list(endpoint: str, key: str) -> list[object]:
@@ -416,6 +442,7 @@ async def fetch_tradingview_price_history_or_raise(
     max_retries: int,
     retry_delay_seconds: float,
     raise_raw_status_error: bool = False,
+    raise_raw_transport_error: bool = False,
     **kwargs,
 ) -> list[dict]:
     for attempt in range(max_retries + 1):
@@ -454,6 +481,9 @@ async def fetch_tradingview_price_history_or_raise(
                 repr(exc),
             )
             if attempt >= max_retries:
+                if raise_raw_transport_error:
+                    raise
+
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail="TradingView API request failed.",
@@ -512,6 +542,7 @@ async def fetch_tradingview_price_history_window_or_raise(
                 target_timestamp=current_target_timestamp,
                 timeframe=timeframe,
                 raise_raw_status_error=True,
+                raise_raw_transport_error=True,
                 **kwargs,
             )
         except httpx.HTTPStatusError as exc:
@@ -538,6 +569,30 @@ async def fetch_tradingview_price_history_window_or_raise(
                 continue
 
             raise_tradingview_http_error(exc)
+        except RETRYABLE_PRICE_TRANSPORT_ERRORS as exc:
+            if chunk_range > min_adaptive_chunk_range:
+                adaptive_chunk_limit = max(
+                    min_adaptive_chunk_range,
+                    chunk_range // 2,
+                )
+                logger.warning(
+                    "Reducing TradingView price chunk size after upstream transport error: "
+                    "asset=%s timeframe=%s previous_range=%s next_range=%s to=%s error=%s",
+                    kwargs["asset"],
+                    timeframe,
+                    chunk_range,
+                    adaptive_chunk_limit,
+                    current_target_timestamp,
+                    repr(exc),
+                )
+                if request_delay_seconds > 0:
+                    await asyncio.sleep(request_delay_seconds)
+                continue
+
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="TradingView API request failed.",
+            ) from exc
 
         chunk_times = []
         for candle in chunk_history:
@@ -776,7 +831,9 @@ async def get_price_data_for_assets(
             # Pull lower timeframe candles when high/low sequencing is needed.
             if pull_high_before:
                 high_before_timeframe = lower_timeframe_for_high_before(timeframe)
-                high_before_to = context_target_timestamp
+                high_before_to = adjust_intraday_year_boundary_target_timestamp(
+                    context_target_timestamp
+                )
                 parent_candle_times = [
                     candle_time
                     for candle in context_history
@@ -789,6 +846,10 @@ async def get_price_data_for_assets(
                     lower_timeframe_start_timestamp,
                     context_target_timestamp,
                     high_before_timeframe,
+                ) + calculate_intraday_target_padding_range(
+                    original_target_timestamp=context_target_timestamp,
+                    adjusted_target_timestamp=high_before_to,
+                    timeframe=high_before_timeframe,
                 )
                 if upstream_request_count > 0 and delay_seconds > 0:
                     await asyncio.sleep(delay_seconds)
@@ -805,7 +866,7 @@ async def get_price_data_for_assets(
                     timeframe=high_before_timeframe,
                     candle_type=candle_type,
                     candle_range=high_before_range,
-                    target_timestamp=context_target_timestamp,
+                    target_timestamp=high_before_to,
                 )
                 upstream_request_count += 1
                 high_before_candles = filter_candles_to_timestamp_range(
