@@ -29,10 +29,12 @@ async def get_git_tree(req: GitTreeRequest):
      repo = parts[2]
      tree_sha = parts[-1]
 
+     query_params = {"recursive": True}
+
      git_tree_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{tree_sha}"
 
      async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.get(git_tree_url)
+        response = await client.get(git_tree_url, params=query_params)
 
      if response.status_code != 200:
         raise HTTPException(status_code=500, detail=response.text)
