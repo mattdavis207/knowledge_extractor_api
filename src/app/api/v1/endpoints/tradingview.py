@@ -117,10 +117,25 @@ def get_tradingview_headers() -> dict[str, str]:
 
 def adjust_intraday_year_boundary_target_timestamp(target_timestamp: int) -> int:
     target_date = unix_seconds_to_date(target_timestamp)
-    if (target_date.month, target_date.day) in {(1, 1), (12, 31)}:
+    if target_date.month == 1 and target_date.day == 1:
         return target_timestamp + INTRADAY_TARGET_BOUNDARY_PADDING_SECONDS
 
+    if target_date.month == 12 and target_date.day >= 30:
+        days_until_january_second = 33 - target_date.day
+        return (
+            target_timestamp
+            + days_until_january_second * INTRADAY_TARGET_BOUNDARY_PADDING_SECONDS
+        )
+
     return target_timestamp
+
+
+def is_broken_intraday_year_boundary_target(target_timestamp: int) -> bool:
+    target_date = unix_seconds_to_date(target_timestamp)
+    return (
+        (target_date.month == 1 and target_date.day == 1)
+        or (target_date.month == 12 and target_date.day >= 30)
+    )
 
 
 def calculate_intraday_target_padding_range(
@@ -519,6 +534,7 @@ async def fetch_tradingview_price_history_window_or_raise(
     candle_range: int,
     target_timestamp: int,
     timeframe: str,
+    stop_on_intraday_year_boundary_gap: bool = False,
     **kwargs,
 ) -> list[dict]:
     timeframe_seconds = timeframe_to_seconds(timeframe)
@@ -535,6 +551,19 @@ async def fetch_tradingview_price_history_window_or_raise(
     min_adaptive_chunk_range = min(100, max_candles_per_request)
 
     while remaining_range > 0:
+        if stop_on_intraday_year_boundary_gap and is_broken_intraday_year_boundary_target(
+            current_target_timestamp
+        ):
+            logger.warning(
+                "Stopping TradingView intraday backfill before broken year-boundary "
+                "target: asset=%s timeframe=%s remaining_range=%s to=%s",
+                kwargs["asset"],
+                timeframe,
+                remaining_range,
+                current_target_timestamp,
+            )
+            break
+
         chunk_range = min(remaining_range, adaptive_chunk_limit)
         try:
             chunk_history = await fetch_tradingview_price_history_or_raise(
@@ -867,6 +896,7 @@ async def get_price_data_for_assets(
                     candle_type=candle_type,
                     candle_range=high_before_range,
                     target_timestamp=high_before_to,
+                    stop_on_intraday_year_boundary_gap=True,
                 )
                 upstream_request_count += 1
                 high_before_candles = filter_candles_to_timestamp_range(
