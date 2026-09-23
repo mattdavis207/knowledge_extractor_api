@@ -2,6 +2,10 @@
 
 Reusable FastAPI service for exposing local endpoints that call external APIs and return normalized data.
 
+## Screenshots (Trading Analysis Automation)
+![n8n Automation Flow Screenshot](screenshots/n8n_automation_ss.png)
+![Analysis Executions Screenshot](screenshots/analysis_executions_ss.png)
+
 ## Project Structure
 
 ```text
